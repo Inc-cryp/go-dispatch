@@ -20,9 +20,31 @@ permissions:
   contents: read
 
 env:
-  # Pinned rather than floating so a toolchain release cannot turn the build
-  # red without a commit in this repository.
+  # Everything is pinned rather than floating, so a toolchain release cannot
+  # turn this pipeline red without a commit in this repository.
   GO_VERSION: "1.25"
+
+  # A linter's Go build has to be at least as new as the `go` directive in
+  # go.mod, or it refuses to load the config. That is a hard error, not a
+  # warning, and it is exactly how run #1 went red:
+  #   can't load config: the Go language version (go1.24) used to build
+  #   golangci-lint is lower than the targeted Go version (1.25.0)
+  # v2.13.2's released binary is built with go1.27; the v2.1.6 this workflow
+  # first pinned shipped a go1.24 build. Verify such a pin against the
+  # released binary, never a locally installed one — `go install ...@v2.1.6`
+  # compiles with the workstation's newer Go, passes, and proves nothing.
+  GOLANGCI_LINT_VERSION: v2.13.2
+
+  # `latest` currently resolves to 2026.2.1, which declares `go 1.26.0` and so
+  # cannot be built by the Go 1.25 toolchain installed below. 2026.1 is the
+  # newest release that still builds on go1.25.
+  STATICCHECK_VERSION: "2026.1"
+
+# `cache: false` on every setup-go step is not an oversight. setup-go keys its
+# cache on go.sum, and this repository deliberately has none — it has zero
+# external dependencies. Leaving the default on makes all three jobs print
+# "Restore cache failed: Dependencies file is not found … Supported file
+# pattern: go.sum", which is noise that trains you to ignore warnings.
 
 jobs:
   # Split into three parallel jobs so a formatting nit reports itself in
@@ -32,60 +54,66 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
-      - name: gofmt
-        run: make fmt-check
+      # Both linters are *installed* here and *run* by `make lint` below.
+      # `make lint` resolves them from PATH, so installing one build while the
+      # Makefile invokes another is the failure mode this file exists to
+      # prevent: the first CI run was green locally and red on GitHub purely
+      # because CI ran a different golangci-lint binary than the workstation.
+      # See the version comments under `env:` above for why each pin is what
+      # it is, and verify pins against released binaries, not local builds.
+      - name: Install staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: go vet
-        run: make vet
-
-      - name: staticcheck
-        uses: dominikh/staticcheck-action@v1
+      # `install-only: true` downloads the released binary and adds it to
+      # PATH without running it; `make lint` below is what runs it.
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
-          install-go: false
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          install-only: true
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.1.6
+      # One entrypoint, so CI and your laptop cannot disagree about what
+      # "lint passes" means. `make lint` = fmt-check, vet, staticcheck,
+      # golangci-lint.
+      - name: make lint
+        run: make lint
 
   test:
     name: Test (race)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
-      # -count=1 defeats the test cache, so "green" always means the tests
-      # actually ran on this commit.
-      - name: go test -race ./...
-        run: make test
-
+      # `make cover` is the full race-detector suite with -count=1 plus a
+      # coverage profile, i.e. a superset of `make test`. Running both would
+      # execute the same suite twice for nothing. -count=1 defeats the test
+      # cache, so "green" always means the tests actually ran on this commit.
       - name: Coverage
-        run: |
-          go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
-          go tool cover -func=coverage.out | tail -n 20
+        run: make cover
 
       # The suite is deliberately about goroutine hygiene (`make leak`), so the
       # reported coverage is a byproduct, not a gate. It is uploaded only as a
       # CI artefact — no third-party coverage service, which keeps the
       # "no external dependencies" claim honest.
       - name: Upload coverage artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -96,13 +124,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
       # `make smoke` builds the demo, starts it, and probes /healthz and /stats.
       # It proves the binary boots and serves, not merely that it links.

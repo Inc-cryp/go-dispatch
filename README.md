@@ -384,7 +384,8 @@ yang sama dengan `-race`, ditambah `make lint` (`fmt-check`, `vet`, `staticcheck
 memeriksa `/healthz` dan `/stats` benar-benar menjawab. Pipeline-nya tidak
 mengimplementasi ulang target apa pun dalam YAML; ia memanggil `make`, sehingga CI
 dan mesin lokal Anda tidak bisa berbeda pendapat soal arti "lulus" — dan seluruh
-gate itu bisa Anda reproduksi di laptop dengan satu perintah: `make check`.
+gate itu bisa Anda reproduksi di laptop dengan dua perintah: `make check` dan
+`make smoke`.
 
 Beberapa perilaku spesifik yang dikunci oleh test:
 
