@@ -1,0 +1,50 @@
+# Syntax: https://docs.docker.com/compose/compose-file/
+#
+# Single-service compose file for the demo binary. There is no database, no
+# broker, and no cache: dispatch is a self-contained in-memory system, so the
+# topology is genuinely one container. This file exists to make "run it" a
+# one-liner, not to imply distributed deployment.
+
+services:
+  dispatch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Pin the toolchain used for the builder stage. Override with
+        # `GO_VERSION=1.24 docker compose build` to reproduce an older build.
+        GO_VERSION: ${GO_VERSION:-1.26}
+    image: dispatch:local
+    container_name: dispatchd
+    # The image runs as uid 65534 (nobody) with no shell and no writable
+    # filesystem, so drop every capability and forbid privilege escalation.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "${DISPATCH_PORT:-8080}:8080"
+    command:
+      - "-addr=:8080"
+      - "-workers=8"
+      - "-rate=200"
+      - "-burst=50"
+      - "-subjects=2000"
+      - "-shutdown-timeout=10s"
+      - "-log-level=info"
+    healthcheck:
+      # The image is `FROM scratch`, so there is no wget/curl to shell out to.
+      # The binary itself is used as the probe instead: /healthz is the only
+      # thing it can fetch, but that is exactly the endpoint that matters.
+      test: ["CMD", "/dispatchd", "-healthcheck=http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    # SIGTERM reaches PID 1 directly (exec-form ENTRYPOINT, no shell wrapper),
+    # which triggers the graceful path: stop HTTP, drain the pool, close the
+    # bus last. 12s leaves headroom over -shutdown-timeout=10s before SIGKILL.
+    stop_signal: SIGTERM
+    stop_grace_period: 12s
+    restart: "no"

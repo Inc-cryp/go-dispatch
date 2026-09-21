@@ -1,0 +1,116 @@
+# golangci-lint configuration.
+#
+# The project has zero external dependencies — every test included — so the
+# linter set is chosen to enforce the conventions the codebase actually commits
+# to, not to maximize the number of enabled linters. Anything that would demand
+# a third-party library is off; anything that would fight `gofmt` is off.
+#
+# Run with: make lint   (staticcheck alone is available via `make staticcheck`)
+
+version: "2"
+
+run:
+  # Tests are part of the deliverable here (roughly half the repository), so
+  # lint them with the same rigor as the library.
+  tests: true
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    # --- correctness -------------------------------------------------------
+    - errcheck # unchecked errors; the %w wrapping convention depends on it
+    - govet # includes the stdlib vet suite, and copylocks via enable-all
+    - staticcheck # the same analyzer `make staticcheck` runs
+    - ineffassign # assignments whose value is never used
+    - unused # unused code (was deadcode/varcheck/structcheck)
+    - bodyclose # http response bodies must be closed (cmd/dispatchd)
+
+    # --- concurrency, the actual subject matter of this repo ----------------
+    # copylocks is a govet pass enabled via govet.enable-all below, not a
+    # standalone linter — a copied mutex is the classic way to break a queue,
+    # so it is worth naming even though it arrives with govet.
+    - noctx # http requests without a context
+    - contextcheck # context propagation through call chains
+
+    # --- style that is not enforced by gofmt --------------------------------
+    - misspell # comment typos
+    - revive # broad, configurable style checks
+    - unconvert # redundant type conversions
+    - unparam # parameters that are always the same value
+    - whitespace # leading/trailing newlines in blocks
+
+  settings:
+    errcheck:
+      # Idiomatic and deliberately ignored in this codebase. `defer x.Close()`
+      # on a resource whose failure cannot be acted on is not a bug.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net/http.ResponseWriter).Write
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment trades readability for padding, and every struct here
+        # is read far more often than it is allocated in bulk.
+        - fieldalignment
+        # shadow flags the deliberate `err :=` inside select branches, which is
+        # the correct scoping, not a bug.
+        - shadow
+
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: package-comments
+        - name: indent-error-flow # early returns, no else after return
+        - name: errorf # errorf("...%v", err) should wrap with %w
+        - name: context-as-argument # ctx is the first parameter
+        - name: context-keys-type # no basic types as context keys
+        - name: var-naming
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    staticcheck:
+      checks:
+        - all
+        # SA1019 checks deprecated symbols; there are no external deps to go
+        # stale, so the default rule set is already appropriate.
+
+    unparam:
+      # Test helpers legitimately take parameters that are constant per call,
+      # and an interface-shaped helper signature is clearer than a special case.
+      check-exported: false
+
+  exclusions:
+    generated: lax
+    rules:
+      # Tests intentionally use nil contexts, duplicate loops to prove
+      # idempotence, and repeat comparisons to exercise a branch. Those are the
+      # points of the tests.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unparam
+          - contextcheck
+          - noctx
+
+      # The demo binary's flag parsing deliberately exits with os.Exit after
+      # flag.Parse prints usage, which is the documented flag-package contract.
+      - path: cmd/dispatchd/main\.go
+        text: "os.Exit"
+        linters:
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/abdillahfazri/dispatch

@@ -1,0 +1,35 @@
+# Compiled binaries. `make build` and `go build ./cmd/dispatchd` both land here.
+/dispatchd
+/cmd/dispatchd/dispatchd
+
+# Test and coverage artifacts.
+*.test
+*.out
+coverage.out
+coverage.html
+cover.out
+
+# Profiling output from `go test -cpuprofile` / `-memprofile`.
+*.prof
+*.pprof
+
+# Benchmark output captured for the README tables.
+/bench.txt
+/bench-old.txt
+
+# Local Docker/compose overrides — anything environment-specific stays out of
+# the repo, while docker-compose.yml itself is committed.
+docker-compose.override.yml
+.env
+.env.*
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Scratch space used while smoke-testing the demo binary.
+/tmp/
+/scratch/

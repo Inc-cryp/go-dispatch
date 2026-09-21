@@ -1,0 +1,37 @@
+# Build context exclusions. The Dockerfile copies only go.mod and the five
+# source directories, so everything else here is pure context-transfer savings —
+# but the .git directory alone is usually larger than the whole module, and
+# sending it on every build is the difference between a fast rebuild and a slow
+# one.
+
+# Version control and CI.
+.git/
+.github/
+.gitignore
+
+# Documentation is not needed to compile; the binary carries no docs.
+docs/
+README.md
+
+# Local build and test artefacts.
+dispatchd
+cmd/dispatchd/dispatchd
+*.test
+*.out
+coverage.*
+*.prof
+bench.txt
+
+# Container and tooling config, not inputs to the image.
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.override.yml
+.golangci.yml
+Makefile
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/
+*.swp
