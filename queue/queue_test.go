@@ -470,8 +470,14 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 	}
 	prodWG.Wait()
 
+	// Wait on the queue's own Done counter, not on the consumer-side counter
+	// above. Consumers bump theirs *before* calling Ack, so waiting on it can
+	// return while the last few acks are still in flight — Done would then
+	// legitimately read low, and Reserved would still be non-zero. Waiting on
+	// Done closes that window because Ack advances it inside the same critical
+	// section that drops the reservation.
 	waitFor(t, "all jobs consumed", func() bool {
-		return consumed.Load() == int64(total)
+		return q.Stats().Done == uint64(total)
 	})
 
 	stats := q.Stats()

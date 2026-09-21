@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abdillahfazri/dispatch/eventbus"
-	"github.com/abdillahfazri/dispatch/queue"
-	"github.com/abdillahfazri/dispatch/worker"
+	"github.com/Inc-cryp/dispatch/eventbus"
+	"github.com/Inc-cryp/dispatch/queue"
+	"github.com/Inc-cryp/dispatch/worker"
 )
 
 // discardLogger keeps expected warnings out of the test output.

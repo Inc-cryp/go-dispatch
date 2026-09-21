@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abdillahfazri/dispatch/queue"
-	"github.com/abdillahfazri/dispatch/ratelimit"
+	"github.com/Inc-cryp/dispatch/queue"
+	"github.com/Inc-cryp/dispatch/ratelimit"
 )
 
 // benchSink is a Sink backed by a channel, so the pool benchmarks measure the

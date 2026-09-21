@@ -34,10 +34,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/abdillahfazri/dispatch/eventbus"
-	"github.com/abdillahfazri/dispatch/queue"
-	"github.com/abdillahfazri/dispatch/ratelimit"
-	"github.com/abdillahfazri/dispatch/worker"
+	"github.com/Inc-cryp/dispatch/eventbus"
+	"github.com/Inc-cryp/dispatch/queue"
+	"github.com/Inc-cryp/dispatch/ratelimit"
+	"github.com/Inc-cryp/dispatch/worker"
 )
 
 // Job kinds produced by the demo generator. Each maps to a topic on the bus and

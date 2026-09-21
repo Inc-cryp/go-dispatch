@@ -8,7 +8,7 @@ event bus.
 the standard library. There is no `go.sum`.
 
 ```
-git clone https://github.com/abdillahfazri/dispatch
+git clone https://github.com/Inc-cryp/dispatch
 cd dispatch
 go test -race ./...
 go run ./cmd/dispatchd -subjects 2000
@@ -353,11 +353,11 @@ enough to create per-test or per-request-batch.
 
 ```
 $ go test -race -count=1 ./...
-ok  github.com/abdillahfazri/dispatch/cmd/dispatchd
-ok  github.com/abdillahfazri/dispatch/eventbus
-ok  github.com/abdillahfazri/dispatch/queue
-ok  github.com/abdillahfazri/dispatch/ratelimit
-ok  github.com/abdillahfazri/dispatch/worker
+ok  github.com/Inc-cryp/dispatch/cmd/dispatchd
+ok  github.com/Inc-cryp/dispatch/eventbus
+ok  github.com/Inc-cryp/dispatch/queue
+ok  github.com/Inc-cryp/dispatch/ratelimit
+ok  github.com/Inc-cryp/dispatch/worker
 ```
 
 Every package runs under `-race`. Beyond the feature tests, each package has a

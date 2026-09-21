@@ -25,8 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/abdillahfazri/dispatch/queue"
-	"github.com/abdillahfazri/dispatch/ratelimit"
+	"github.com/Inc-cryp/dispatch/queue"
+	"github.com/Inc-cryp/dispatch/ratelimit"
 )
 
 // Errors returned by pool operations.

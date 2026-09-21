@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abdillahfazri/dispatch/queue"
-	"github.com/abdillahfazri/dispatch/ratelimit"
+	"github.com/Inc-cryp/dispatch/queue"
+	"github.com/Inc-cryp/dispatch/ratelimit"
 )
 
 // fakeSink is a scriptable Sink. A real queue cannot be made to fail Ack or
