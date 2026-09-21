@@ -378,6 +378,14 @@ mengulang hingga 5 detik dan mencetak seluruh `runtime.Stack` saat gagal. Gorout
 yang bocor adalah mode kegagalan yang baru muncul di produksi berbulan-bulan
 kemudian, jadi ia mendapat test eksplisit alih-alih sekadar komentar.
 
+Baris-baris di atas bukan tempelan: `.github/workflows/ci.yml` menjalankan suite
+yang sama dengan `-race`, ditambah `make lint` (`fmt-check`, `vet`, `staticcheck`,
+`golangci-lint`) dan `make smoke` — yang membangun `dispatchd`, menjalankannya, lalu
+memeriksa `/healthz` dan `/stats` benar-benar menjawab. Pipeline-nya tidak
+mengimplementasi ulang target apa pun dalam YAML; ia memanggil `make`, sehingga CI
+dan mesin lokal Anda tidak bisa berbeda pendapat soal arti "lulus" — dan seluruh
+gate itu bisa Anda reproduksi di laptop dengan satu perintah: `make check`.
+
 Beberapa perilaku spesifik yang dikunci oleh test:
 
 - `TestWaitWithAlreadyCancelledContextDoesNotConsume` — regresi fail-open tadi.
@@ -409,7 +417,7 @@ README ini adalah tur singkatnya; [`docs/DESIGN.md`](docs/DESIGN.md) adalah bagi
 dalamnya — invariant, taksonomi kegagalan, bug yang ditangkap test, dan apa yang
 harus diubah untuk backend yang durable.
 
-Total: ~6,700 baris termasuk test, tersebar di 27 file.
+Total: ~6,700 baris termasuk test, tersebar di 30 file.
 
 ### Flag `dispatchd`
 
@@ -459,3 +467,11 @@ alasan bentuknya seperti sekarang.
 - [ ] **Structured tracing**: propagasikan `traceparent` lewat metadata
       `Entry.Payload` agar retry sebuah job muncul sebagai satu trace.
 - [ ] **Prometheus metrics exporter** untuk counter yang sudah diekspos `Stats()`.
+
+---
+
+## Lisensi
+
+MIT — lihat [`LICENSE`](LICENSE). Singkatnya: pakai, ubah, dan jual sesuka Anda,
+selama notice hak cipta dan izinnya ikut disertakan. Perangkat lunaknya datang
+tanpa jaminan apa pun.
