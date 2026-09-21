@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Inc-cryp/dispatch/queue"
+	"github.com/Inc-cryp/go-dispatch/queue"
 )
 
 // TestNoGoroutineLeakAfterShutdown verifies the pool releases its dispatcher and

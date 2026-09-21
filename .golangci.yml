@@ -113,4 +113,4 @@ formatters:
       simplify: true
     goimports:
       local-prefixes:
-        - github.com/Inc-cryp/dispatch
+        - github.com/Inc-cryp/go-dispatch

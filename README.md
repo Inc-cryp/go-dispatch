@@ -1,20 +1,20 @@
 # dispatch
 
-A job dispatch engine in pure Go: a priority queue with SQS-style delivery
-semantics, a bounded worker pool, a composable rate limiter, and a topic-routed
-event bus.
+Sebuah job dispatch engine murni Go: priority queue dengan semantik pengiriman
+bergaya SQS, worker pool berbatas, rate limiter yang bisa dikomposisi, dan event
+bus yang dirutekan berdasarkan topik.
 
-**Zero external dependencies.** Everything — including every test — is built on
-the standard library. There is no `go.sum`.
+**Tanpa dependensi eksternal.** Semuanya — termasuk setiap test — dibangun di atas
+standard library. Tidak ada `go.sum`.
 
 ```
-git clone https://github.com/Inc-cryp/dispatch
-cd dispatch
+git clone https://github.com/Inc-cryp/go-dispatch
+cd go-dispatch
 go test -race ./...
 go run ./cmd/dispatchd -subjects 2000
 ```
 
-Then in another shell:
+Lalu di shell lain:
 
 ```
 curl localhost:8080/healthz
@@ -23,37 +23,38 @@ curl -s localhost:8080/stats | python3 -m json.tool
 
 ---
 
-## Why this exists
+## Kenapa ini ada
 
-Job queues are one of those things that look trivial until they are not. The
-interesting part is not "put a struct in a channel" — it is everything that
-happens when a worker dies mid-job, when a downstream service rate-limits you,
-when the process receives `SIGTERM` with 400 jobs in flight, and when a caller
-polling for shutdown accidentally holds a lock that blocks every producer.
+Job queue adalah salah satu hal yang terlihat sepele sampai ternyata tidak. Bagian
+yang menarik bukan "taruh sebuah struct ke dalam channel" — melainkan semua yang
+terjadi ketika seorang worker mati di tengah job, ketika layanan hilir
+me-rate-limit Anda, ketika proses menerima `SIGTERM` dengan 400 job sedang
+melayang, dan ketika pemanggil yang sedang polling shutdown tanpa sengaja memegang
+lock yang memblokir semua producer.
 
-This is a portfolio-scale implementation of that problem, written to be read.
-Each package is standalone, independently testable, and free of background
-goroutines you did not ask for.
+Ini adalah implementasi berskala portofolio untuk masalah tersebut, ditulis agar
+enak dibaca. Setiap package berdiri sendiri, bisa di-test secara independen, dan
+bebas dari goroutine latar belakang yang tidak Anda minta.
 
-### What is honest about this design
+### Apa yang jujur dari desain ini
 
-It is a **single-node, in-memory** queue. It does not claim otherwise. The
-durable, distributed version is a different program: it needs a replicated log,
-fencing tokens, and idempotent consumers. What this repo demonstrates is the
-*semantics and the concurrency machinery* — at-least-once delivery, visibility
-timeouts, exponential backoff, dead-lettering, backpressure, graceful drain —
-behind interfaces narrow enough that an SQS or Redis or Postgres backend can be
-swapped in without touching the worker pool.
+Ini adalah queue **single-node dan in-memory**. Repo ini tidak mengklaim
+sebaliknya. Versi durable dan terdistribusi adalah program yang berbeda: ia
+membutuhkan replicated log, fencing token, dan consumer yang idempotent. Yang
+didemonstrasikan repo ini adalah *semantik dan mesin konkurensinya* — pengiriman
+at-least-once, visibility timeout, exponential backoff, dead-lettering,
+backpressure, graceful drain — di balik interface yang cukup sempit sehingga
+backend SQS, Redis, atau Postgres bisa ditukar tanpa menyentuh worker pool.
 
 ---
 
-## Architecture
+## Arsitektur
 
 ```mermaid
 flowchart LR
     P["Producer<br/><i>Enqueue(Entry)</i>"] --> Q
 
-    subgraph Q["queue.Queue — single scheduler goroutine"]
+    subgraph Q["queue.Queue — satu goroutine scheduler"]
         H["priority heap<br/>min-heap by (priority, readyAt, seq)"]
         V["reservation table<br/>visibility deadline per delivery"]
         D["dead-letter list<br/>capped, ring-buffered IDs"]
@@ -62,7 +63,7 @@ flowchart LR
     Q -->|"Dequeue(ctx)<br/>reserves + arms visibility timer"| W
 
     subgraph W["worker.Pool"]
-        L{"ratelimit.Limiter<br/>optional"}
+        L{"ratelimit.Limiter<br/>opsional"}
         L --> W1["worker 1"]
         L --> W2["worker 2"]
         L --> WN["worker N"]
@@ -79,64 +80,66 @@ flowchart LR
     EB --> SN["..."]
 ```
 
-The dependency graph is strictly layered, with no cycles:
+Graf dependensinya berlapis secara ketat, tanpa siklus:
 
-| Package | Imports (internal) | Role |
+| Package | Import (internal) | Peran |
 | --- | --- | --- |
-| `queue` | — | Durable-ish job storage, delivery semantics, retries |
-| `ratelimit` | — | Token bucket, fixed window, `Multi`, per-key `Keyed` |
-| `eventbus` | — | Topic-pattern pub/sub with per-subscriber drop policies |
-| `worker` | `queue`, `ratelimit` | Bounded pool; calls the `Sink` interface |
-| `cmd/dispatchd` | all four | Wiring, HTTP health/stats, signal handling |
+| `queue` | — | Penyimpanan job yang mendekati durable, semantik pengiriman, retry |
+| `ratelimit` | — | Token bucket, fixed window, `Multi`, `Keyed` per-key |
+| `eventbus` | — | Pub/sub dengan pola topik dan drop policy per subscriber |
+| `worker` | `queue`, `ratelimit` | Pool berbatas; memanggil interface `Sink` |
+| `cmd/dispatchd` | keempatnya | Wiring, HTTP health/stats, penanganan signal |
 
-`queue`, `ratelimit`, and `eventbus` know nothing about each other. `worker`
-never imports `eventbus` — the bridge between the queue's event stream and the
-bus lives in `cmd/dispatchd`, so neither package grows a dependency it does not
-need.
+`queue`, `ratelimit`, dan `eventbus` tidak tahu apa-apa satu sama lain. `worker`
+tidak pernah meng-import `eventbus` — jembatan antara event stream milik queue dan
+bus berada di `cmd/dispatchd`, sehingga tidak ada package yang menumbuhkan
+dependensi yang tidak dibutuhkannya.
 
 ---
 
-## Design decisions worth defending
+## Keputusan desain yang layak dipertahankan
 
-These are the choices a reviewer would actually question. Each one is a trade-off,
-not an accident.
+Ini adalah pilihan-pilihan yang benar-benar akan dipertanyakan seorang reviewer.
+Masing-masing adalah trade-off, bukan kebetulan.
 
-### The queue owns exactly one goroutine
+### Queue memelihara tepat satu goroutine
 
-`queue.New` starts a single scheduler goroutine. It is the only thing that mutates
-delayed-delivery and visibility state. Producers and consumers take a mutex to
-touch the heap, but *time* belongs to the scheduler alone.
+`queue.New` menjalankan satu goroutine scheduler. Ia satu-satunya yang mengubah
+delayed-delivery dan visibility state. Producer dan consumer mengambil mutex untuk
+menyentuh heap, tetapi *waktu* hanya milik scheduler.
 
-The alternative — a `time.AfterFunc` per job — does not survive contact with a
-million jobs. It also makes shutdown non-deterministic: there is no way to know
-when all pending timers have fired. One goroutine with a `time.Timer` that gets
-reset to the next deadline is predictable, cheap, and trivially drainable.
+Alternatifnya — `time.AfterFunc` per job — tidak akan bertahan saat berhadapan
+dengan sejuta job. Ia juga membuat shutdown menjadi non-deterministik: tidak ada
+cara mengetahui kapan semua timer yang tertunda sudah selesai menyala. Satu
+goroutine dengan `time.Timer` yang di-reset ke deadline berikutnya itu
+prediktabel, murah, dan mudah di-drain.
 
-`Queue.Close()` is idempotent and concurrency-safe; it stops the scheduler, drains
-its event fan-out, and marks the queue closed. Enqueueing after that returns
-`ErrClosed` rather than panicking.
+`Queue.Close()` bersifat idempotent dan aman konkuren; ia menghentikan scheduler,
+menguras fan-out event-nya, lalu menandai queue tertutup. Enqueue setelah itu
+mengembalikan `ErrClosed`, bukan panic.
 
-### Visibility timeout instead of a lock held across the handler
+### Visibility timeout, bukan lock yang dipegang sepanjang handler
 
-`Dequeue` does not hand out a job and forget it. It records a reservation with a
-deadline and arms the scheduler. The worker must `Ack` (done) or `Nack` (retry or
-dead-letter) before that deadline. If the process is killed, the reservation
-simply lapses and the job becomes ready again — which is what makes delivery
-at-least-once rather than at-most-once.
+`Dequeue` tidak menyerahkan job lalu melupakannya. Ia mencatat reservation dengan
+sebuah deadline dan mempersenjatai scheduler. Worker harus memanggil `Ack`
+(selesai) atau `Nack` (retry atau dead-letter) sebelum deadline itu. Jika prosesnya
+dibunuh, reservation-nya hanya kedaluwarsa dan job kembali siap — inilah yang
+membuat pengirimannya at-least-once, bukan at-most-once.
 
-A lapsed reservation deliberately **does not** consume an attempt. A worker that
-was OOM-killed did not fail the job; punishing the job for infrastructure failure
-would silently burn through `MaxAttempts` during a crash loop.
+Reservation yang kedaluwarsa sengaja **tidak** memakan satu attempt. Worker yang
+OOM-killed tidak menggagalkan job; menghukum job karena kegagalan infrastruktur
+akan diam-diam menghabiskan `MaxAttempts` selama crash loop.
 
-### Priorities are (priority, readyAt, sequence) — and the sentinel matters
+### Prioritas adalah (priority, readyAt, sequence) — dan sentinel-nya penting
 
-An immediate job is normalized to a zero `RunAt`, not `time.Now()`. This was a
-real bug: when every entry carried its own `time.Now()`, that timestamp was the
-second sort key, so it always decided the ordering and the priority field was
-dead code. Normalizing to the zero time lets priority and insertion order decide,
-and only *delayed* jobs are ordered by wall clock.
+Job yang sifatnya immediate dinormalkan ke `RunAt` bernilai nol, bukan
+`time.Now()`. Ini dulunya bug nyata: ketika setiap entry membawa `time.Now()`
+miliknya sendiri, timestamp itu menjadi kunci urutan kedua, sehingga ia selalu
+menentukan ordering dan field priority menjadi dead code. Menormalkan ke zero time
+membuat prioritas dan urutan penyisipan yang menentukan, dan hanya job *tertunda*
+yang diurutkan berdasarkan wall clock.
 
-### `DefaultBackoff` applies the cap after the jitter
+### `DefaultBackoff` menerapkan cap setelah jitter
 
 ```go
 delay := base * (1 << (attempt - 1))   // exponential
@@ -144,119 +147,125 @@ delay += jitter(delay)                 // decorrelate retries
 if delay > cap { delay = cap }         // cap LAST
 ```
 
-Capping before adding jitter means the cap can be exceeded, which defeats the
-point of a cap. This was also a real bug found by the test suite.
+Memberi cap sebelum menambahkan jitter berarti cap bisa terlampaui, dan itu
+menggagalkan tujuan cap itu sendiri. Ini juga bug nyata yang ditemukan test suite.
 
-### `Publish` is synchronous fan-out; handlers are asynchronous
+### `Publish` adalah fan-out sinkron; handler-nya asinkron
 
-`eventbus.Publish` matches subscriptions and delivers to each subscriber's
-buffered channel *before returning*. Handler execution is off the publisher's
-goroutine. This gives the publisher a bounded, honest cost: one channel send per
-matching subscriber.
+`eventbus.Publish` mencocokkan subscription dan mengirim ke buffered channel milik
+setiap subscriber *sebelum kembali*. Eksekusi handler berjalan di luar goroutine
+publisher. Ini memberi publisher biaya yang terbatas dan jujur: satu pengiriman
+channel per subscriber yang cocok.
 
-But it means something important: a full subscriber buffer must never be able to
-block the publisher. When the buffer is full, the subscriber's `DropPolicy`
-decides:
+Tetapi artinya ada satu hal penting: buffer subscriber yang penuh tidak boleh
+sampai memblokir publisher. Ketika buffer penuh, `DropPolicy` milik subscriber
+yang memutuskan:
 
-- `DropNewest` (default) — the publisher never blocks; the event is dropped and
-  counted on `Subscription.Dropped()`. **A slow subscriber cannot slow you down.**
-- `Block` — the publisher waits for room, bounded by the context.
+- `DropNewest` (default) — publisher tidak pernah terblokir; event-nya dibuang dan
+  dihitung di `Subscription.Dropped()`. **Subscriber yang lambat tidak bisa
+  memperlambat Anda.**
+- `Block` — publisher menunggu sampai ada ruang, dibatasi context.
 
-The default is `DropNewest` precisely because the failure mode of `Block` is a
-slow consumer mysteriously stalling unrelated producers. Dropping is loud
-(`Dropped()` is a counter, not a log line) and local.
+Default-nya `DropNewest` justru karena mode kegagalan dari `Block` adalah consumer
+lambat yang secara misterius menahan producer lain yang tidak berhubungan.
+Membuang itu berisik (`Dropped()` adalah counter, bukan baris log) dan bersifat
+lokal.
 
-### `matching()` releases the bus lock before delivering
+### `matching()` melepas lock bus sebelum mengirim
 
-Under `Block`, a channel send can wait indefinitely. Holding the bus lock across
-that send would let one slow subscriber stall *every* publisher on the bus. So the
-batch of matching subscribers is collected under the lock, and the lock is
-released before any send happens.
+Di bawah `Block`, pengiriman channel bisa menunggu tanpa batas. Memegang lock bus
+sepanjang pengiriman itu akan membuat satu subscriber lambat menahan *setiap*
+publisher di bus. Karena itu kumpulan subscriber yang cocok dikumpulkan di bawah
+lock, lalu lock-nya dilepas sebelum pengiriman mana pun terjadi.
 
-### Rate limiters have no background goroutines
+### Rate limiter tidak punya goroutine latar belakang
 
-A token bucket refills lazily: each call computes elapsed time and adds the
-corresponding tokens. No goroutine, no timer per limiter, cost proportional to
-actual use.
+Token bucket mengisi ulang secara lazy: setiap panggilan menghitung waktu yang
+berlalu dan menambahkan token yang sesuai. Tanpa goroutine, tanpa timer per
+limiter, biaya sebanding dengan pemakaian sebenarnya.
 
-Every limiter takes an injected clock (`WithClock`). Tests advance time explicitly
-instead of sleeping, which is why the test suite runs in seconds instead of
-minutes and is not flaky.
+Setiap limiter menerima clock yang di-inject (`WithClock`). Test memajukan waktu
+secara eksplisit alih-alih tidur, itulah sebabnya test suite berjalan dalam
+hitungan detik alih-alih menit dan tidak flaky.
 
-### `Keyed` deliberately does **not** implement `Limiter`
+### `Keyed` sengaja **tidak** mengimplementasikan `Limiter`
 
-`TokenBucket`, `FixedWindow`, and `Multi` are `Limiter`s — they take no key.
-`Keyed` requires one, so its methods are `Allow(key)`, `Reserve(key)`,
+`TokenBucket`, `FixedWindow`, dan `Multi` adalah `Limiter` — mereka tidak menerima
+key. `Keyed` memerlukan satu, jadi method-nya adalah `Allow(key)`, `Reserve(key)`,
 `Wait(ctx, key)`.
 
-This is a design decision with a test pinning it (`TestKeyedIsNotALimiter`). The
-temptation is to add zero-argument stubs so `Keyed` satisfies `Limiter` and can be
-passed anywhere. But a `Wait` stub that returns `nil` makes an unkeyed caller fail
-**open** — it would silently never throttle anything. Making the signatures
-incompatible turns a silent production bug into a compile error.
+Ini keputusan desain yang dikunci oleh sebuah test (`TestKeyedIsNotALimiter`).
+Godaannya adalah menambahkan stub tanpa argumen agar `Keyed` memenuhi `Limiter`
+dan bisa dilempar ke mana saja. Tapi stub `Wait` yang mengembalikan `nil` membuat
+pemanggil tanpa key gagal secara **fail-open** — ia diam-diam tidak akan pernah
+melakukan throttling apa pun. Membuat signature-nya tidak kompatibel mengubah bug
+produksi yang senyap menjadi compile error.
 
-### `Wait` checks the context before consuming a token
+### `Wait` memeriksa context sebelum menghabiskan token
 
-`TokenBucket.Wait` on an already-cancelled context returns `ctx.Err()` without
-consuming capacity. This was a fail-open bug found by the verification pass: the
-loop only checked `ctx.Err()` on the sleep path, so the first iteration would
-consume a token and then report success on a dead context. Both `Wait`
-implementations now check at the top of every iteration and again after granting.
+`TokenBucket.Wait` pada context yang sudah dibatalkan mengembalikan `ctx.Err()`
+tanpa menghabiskan kapasitas. Ini bug fail-open yang ditemukan saat proses
+verifikasi: loop-nya hanya memeriksa `ctx.Err()` di jalur sleep, sehingga iterasi
+pertama akan menghabiskan satu token lalu melaporkan sukses pada context yang
+sudah mati. Kedua implementasi `Wait` sekarang memeriksa di awal setiap iterasi
+dan sekali lagi setelah memberikan token.
 
-### The worker pool splits its contexts in two
+### Worker pool memisahkan context-nya menjadi dua
 
-`Pool.Start(ctx)` derives a *dispatch* context (cancellable, gates `Dequeue` and
-limiter waits) but passes the caller's original `ctx` to handlers. Graceful
-`Shutdown` cancels only the dispatch context, so in-flight jobs run to completion
-instead of being cancelled out from under the handler.
+`Pool.Start(ctx)` menurunkan sebuah context *dispatch* (bisa dibatalkan, menggerbangi
+`Dequeue` dan penantian limiter) tetapi meneruskan `ctx` asli milik pemanggil ke
+handler. `Shutdown` yang graceful hanya membatalkan context dispatch, sehingga job
+yang sedang berjalan selesai sampai tuntas alih-alih dibatalkan di tengah handler.
 
-`Shutdown(ctx)` then drains: it stops dequeueing, waits for in-flight jobs up to
-`DrainTimeout`, and on expiry returns an error wrapping `context.DeadlineExceeded`
-with the number of jobs still in flight. It is idempotent — calling it twice is
-safe and the second call returns immediately.
+`Shutdown(ctx)` lalu melakukan drain: ia berhenti melakukan dequeue, menunggu job
+yang masih melayang sampai `DrainTimeout`, dan saat kedaluwarsa mengembalikan error
+yang membungkus `context.DeadlineExceeded` beserta jumlah job yang masih melayang.
+Ia idempotent — memanggilnya dua kali aman dan panggilan kedua langsung kembali.
 
-### `worker.New` panics on a nil sink or nil handler
+### `worker.New` panic pada sink atau handler yang nil
 
-A nil handler used to be silently replaced with a no-op, which means every job
-succeeds while doing nothing: silent, total data loss. Programming errors at
-construction time should be loud. `New` panics with an explicit message; a
-`Start(nil)` context returns `ErrNilContext` rather than panicking inside
-`context.WithCancel`.
+Handler nil dulunya diam-diam diganti dengan no-op, yang berarti setiap job
+"berhasil" sambil tidak melakukan apa pun: kehilangan data total yang senyap.
+Kesalahan pemrograman pada waktu konstruksi seharusnya berisik. `New` panic dengan
+pesan yang eksplisit; context `Start(nil)` mengembalikan `ErrNilContext` alih-alih
+panic di dalam `context.WithCancel`.
 
-### Errors are values, and they are wrapped
+### Error adalah nilai, dan ia dibungkus
 
-Sentinels (`queue.ErrClosed`, `worker.ErrAlreadyStarted`,
-`ratelimit`-free by design, `eventbus.ErrBusClosed`, ...) are checked with
-`errors.Is`. Wrapped errors use `%w`. A panicking handler is reported as
-`ErrHandlerPanic` wrapped with the job ID, so a buggy handler is distinguishable
-from a job that legitimately failed downstream.
+Sentinel (`queue.ErrClosed`, `worker.ErrAlreadyStarted`, bebas `ratelimit` secara
+desain, `eventbus.ErrBusClosed`, ...) diperiksa dengan `errors.Is`. Error yang
+dibungkus memakai `%w`. Handler yang panic dilaporkan sebagai `ErrHandlerPanic`
+yang dibungkus bersama job ID, sehingga handler yang bermasalah bisa dibedakan
+dari job yang gagal secara sah di hilir.
 
-### Interfaces are defined where they are consumed
+### Interface didefinisikan di tempat ia dikonsumsi
 
-`worker.Sink` is the four-method subset of `*queue.Queue` the pool actually needs
-(`Dequeue`, `Ack`, `Nack`, `Extend`). `cmd/dispatchd` passes the real queue; tests
-pass a scriptable fake. This is the Go proverb made concrete: the consumer
-declares the interface, so the pool can be tested without a queue at all.
+`worker.Sink` adalah subset empat method dari `*queue.Queue` yang benar-benar
+dibutuhkan pool (`Dequeue`, `Ack`, `Nack`, `Extend`). `cmd/dispatchd` meneruskan
+queue asli; test meneruskan fake yang bisa diskenariokan. Inilah peribahasa Go yang
+diwujudkan: consumer-lah yang mendeklarasikan interface, sehingga pool bisa
+di-test tanpa queue sama sekali.
 
-### The pool runs an explicit set of goroutines
+### Pool menjalankan sekumpulan goroutine yang eksplisit
 
-`Start` launches a fixed number of worker goroutines (`WithWorkers`) plus a
-dispatcher that calls `Dequeue` and hands each delivery to a free worker over a
-buffered channel. Workers never touch a reservation directly — they report the
-outcome and the release path acks or nacks. Keeping the number of goroutines that
-call into the queue small and bounded is what makes the queue's own locking
-predictable.
+`Start` meluncurkan sejumlah goroutine worker yang tetap (`WithWorkers`) plus
+sebuah dispatcher yang memanggil `Dequeue` dan menyerahkan setiap delivery ke
+worker yang kosong lewat buffered channel. Worker tidak pernah menyentuh
+reservation secara langsung — mereka melaporkan hasilnya dan jalur pelepasan yang
+melakukan ack atau nack. Menjaga jumlah goroutine yang memanggil ke dalam queue
+tetap kecil dan berbatas adalah yang membuat locking di queue itu sendiri
+prediktabel.
 
-`InFlight()` and `Stats()` are served from atomics and a channel length, so
-observing a running pool never blocks it.
+`InFlight()` dan `Stats()` dilayani dari atomic dan panjang channel, sehingga
+mengamati pool yang sedang berjalan tidak pernah memblokirnya.
 
 ---
 
-## Benchmarks
+## Benchmark
 
-Measured, not estimated. Every number below comes from
-`go test -bench . -benchtime 100ms` on an **Apple M1 (8 cores), go1.26.0,
-darwin/arm64**. Reproduce with:
+Diukur, bukan diperkirakan. Setiap angka di bawah berasal dari
+`go test -bench . -benchtime 100ms` pada **Apple M1 (8 core), go1.26.0,
+darwin/arm64**. Reproduksi dengan:
 
 ```
 go test -run XXX -bench . -benchtime 100ms ./...
@@ -268,15 +277,15 @@ go test -run XXX -bench . -benchtime 100ms ./...
 | --- | ---: | ---: | ---: |
 | `Enqueue` | 411.8 | 289 | 4 |
 | `EnqueueParallel` | 575.0 | — | — |
-| `EnqueueDequeueAck` (full lifecycle) | 562.4 | 0 | 0 |
+| `EnqueueDequeueAck` (siklus penuh) | 562.4 | 0 | 0 |
 | `DequeuePriority` | 1030 | 0 | 0 |
 | `DequeueParallel` | 751.5 | 0 | — |
 | `SubscribeFanout/subscribers=1` | 609.0 | 278 | 3 |
 | `SubscribeFanout/subscribers=4` | 1047 | 311 | 3 |
 | `SubscribeFanout/subscribers=16` | 1357 | 407 | 4 |
 
-The zero-allocation steady state is the point: after `Enqueue` allocates the
-entry, the dequeue/ack cycle recycles and allocates nothing.
+Steady state yang nol alokasi itulah intinya: setelah `Enqueue` mengalokasikan
+entry-nya, siklus dequeue/ack mendaur ulang dan tidak mengalokasikan apa pun.
 
 ### `eventbus`
 
@@ -287,7 +296,7 @@ entry, the dequeue/ack cycle recycles and allocates nothing.
 | `PublishNoMatch` | 290.2 | 223 | 7 |
 | `PublishSync` | 155.3 | 79 | 3 |
 | `HandlerThroughput` (end-to-end) | 364.7 | 79 | 3 |
-| `PublishDropNewest` (overflow path) | 150.3 | 79 | 3 |
+| `PublishDropNewest` (jalur overflow) | 150.3 | 79 | 3 |
 | `MatchTopic/job.created` | 69.08 | 64 | 2 |
 | `MatchTopic/job.*` | 66.51 | 64 | 2 |
 | `MatchTopic/job.>` | 66.38 | 64 | 2 |
@@ -296,16 +305,16 @@ entry, the dequeue/ack cycle recycles and allocates nothing.
 | `SubscribeFanout/subscribers=8` | 1925 | 583 | 17 |
 | `SubscribeFanout/subscribers=32` | 6417 | 2311 | 65 |
 
-Two things stand out. The overflow path (150 ns/op) is *cheaper* than the
-delivery path (246 ns/op), which is exactly what `DropNewest` should look like —
-admission control is doing its job. And fan-out is linear: ~200 ns per
-subscriber, so broadcast cost is predictable rather than quadratic.
+Dua hal menonjol. Jalur overflow (150 ns/op) justru *lebih murah* daripada jalur
+pengiriman (246 ns/op), dan memang begitulah bentuk `DropNewest` yang seharusnya —
+admission control sedang menjalankan tugasnya. Dan fan-out-nya linear: ~200 ns per
+subscriber, sehingga biaya broadcast-nya terprediksi, bukan kuadratik.
 
 ### `ratelimit`
 
 | Benchmark | ns/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: |
-| `TokenBucketAllow` (denied) | 30.13 | 0 | 0 |
+| `TokenBucketAllow` (ditolak) | 30.13 | 0 | 0 |
 | `TokenBucketAllowGranted` | 39.05 | 0 | 0 |
 | `TokenBucketAllowParallel` | 120.9 | 0 | 0 |
 | `TokenBucketReserve` | 29.12 | 0 | 0 |
@@ -317,14 +326,15 @@ subscriber, so broadcast cost is predictable rather than quadratic.
 | `MultiAllow/limiters=8` | 213.9 | 0 | 0 |
 | `KeyedGet` | 17.70 | 0 | 0 |
 | `KeyedGetParallel` | 186.2 | 14 | 1 |
-| `KeyedEviction` (worst case LRU) | 183.9 | 168 | 5 |
-| `WaitImmediate` (fast path) | 72.84 | 0 | 0 |
+| `KeyedEviction` (kasus terburuk LRU) | 183.9 | 168 | 5 |
+| `WaitImmediate` (jalur cepat) | 72.84 | 0 | 0 |
 
-The whole limiter is allocation-free on its hot paths. Denial is as cheap as
-grant, so a limiter that is rejecting traffic is not a liability — which matters,
-because the limiter usually runs at its most contended moment when it is
-throttling. `KeyedGet` at 17.7 ns is a plain map hit; `KeyedEviction` pays 168 B
-for the fresh limiter, which is the honest cost of bounded memory.
+Seluruh limiter ini bebas alokasi di jalur panasnya. Penolakan sama murahnya
+dengan pemberian, jadi limiter yang sedang menolak trafik bukanlah beban — dan itu
+penting, karena limiter biasanya berjalan pada momen paling diperebutkan justru
+ketika ia sedang melakukan throttling. `KeyedGet` pada 17.7 ns adalah map hit
+biasa; `KeyedEviction` membayar 168 B untuk limiter baru, dan itulah biaya jujur
+dari memori yang berbatas.
 
 ### `worker`
 
@@ -338,113 +348,114 @@ for the fresh limiter, which is the honest cost of bounded memory.
 | `ResultCallback/enabled` | 499.3 | 0 | 0 |
 | `PoolStartShutdown` | 4709 | 3089 | 25 |
 
-Worth being honest about the shape here: throughput is ~400–500 ns/job and
-**does not improve past 4 workers** on an 8-core M1. That is the benchmark
-sink (a single buffered channel) becoming the bottleneck, not the pool — the
-measured value is scheduling overhead plus channel handoff, so it is a floor,
-not a ceiling. The no-op handler costs nothing, which is the intended signal.
+Jujur soal bentuknya di sini: throughput-nya ~400–500 ns/job dan **tidak membaik
+melewati 4 worker** pada M1 8-core. Itu karena sink benchmark-nya (satu buffered
+channel) yang menjadi bottleneck, bukan pool-nya — nilai yang terukur adalah
+overhead scheduling plus serah-terima channel, jadi ini lantai, bukan langit-langit.
+Handler no-op tidak memakan biaya apa pun, dan itulah sinyal yang dimaksudkan.
 
-`PoolStartShutdown` at 4.7 µs / 25 allocs tells you a short-lived pool is cheap
-enough to create per-test or per-request-batch.
+`PoolStartShutdown` pada 4.7 µs / 25 alokasi memberi tahu Anda bahwa pool berumur
+pendek cukup murah untuk dibuat per-test atau per-batch request.
 
 ---
 
-## What the tests cover
+## Apa yang dicakup test
 
 ```
 $ go test -race -count=1 ./...
-ok  github.com/Inc-cryp/dispatch/cmd/dispatchd
-ok  github.com/Inc-cryp/dispatch/eventbus
-ok  github.com/Inc-cryp/dispatch/queue
-ok  github.com/Inc-cryp/dispatch/ratelimit
-ok  github.com/Inc-cryp/dispatch/worker
+ok  github.com/Inc-cryp/go-dispatch/cmd/dispatchd
+ok  github.com/Inc-cryp/go-dispatch/eventbus
+ok  github.com/Inc-cryp/go-dispatch/queue
+ok  github.com/Inc-cryp/go-dispatch/ratelimit
+ok  github.com/Inc-cryp/go-dispatch/worker
 ```
 
-Every package runs under `-race`. Beyond the feature tests, each package has a
-`leak_test.go` that snapshots `runtime.NumGoroutine()`, churns the package's
-resources (queue close, bus subscribe/close cycles, pool start/shutdown, limiter
-key churn), and then asserts the count returns to the baseline — retrying for up
-to 5 seconds and dumping the full `runtime.Stack` on failure. Leaked goroutines
-are the failure mode that only shows up in production months later, so they get
-an explicit test rather than a comment.
+Setiap package dijalankan dengan `-race`. Di luar test fitur, setiap package punya
+`leak_test.go` yang mengambil snapshot `runtime.NumGoroutine()`, mengocok sumber
+daya package tersebut (queue close, siklus subscribe/close bus, start/shutdown
+pool, key churn limiter), lalu menegaskan jumlahnya kembali ke baseline —
+mengulang hingga 5 detik dan mencetak seluruh `runtime.Stack` saat gagal. Goroutine
+yang bocor adalah mode kegagalan yang baru muncul di produksi berbulan-bulan
+kemudian, jadi ia mendapat test eksplisit alih-alih sekadar komentar.
 
-Some specific behaviours pinned by tests:
+Beberapa perilaku spesifik yang dikunci oleh test:
 
-- `TestWaitWithAlreadyCancelledContextDoesNotConsume` — the fail-open regression.
-- `TestKeyedIsNotALimiter` — the type-system choice above.
-- Priority ordering vs. FIFO for equal priorities, including delayed jobs.
-- A lapsed reservation does not consume an attempt.
-- `Nack` returns `ErrRetryScheduled` when it will retry, `ErrJobFailed` when it
-  dead-letters.
-- `Shutdown` on an already-stopped pool, and `Close` called twice on every type.
-- Panicking handlers become `ErrHandlerPanic` instead of killing the pool.
-- `Publish` under `Block` policy unblocks when the bus closes.
+- `TestWaitWithAlreadyCancelledContextDoesNotConsume` — regresi fail-open tadi.
+- `TestKeyedIsNotALimiter` — pilihan type-system di atas.
+- Urutan prioritas versus FIFO untuk prioritas yang sama, termasuk job tertunda.
+- Reservation yang kedaluwarsa tidak memakan satu attempt.
+- `Nack` mengembalikan `ErrRetryScheduled` saat akan retry, `ErrJobFailed` saat
+  dead-letter.
+- `Shutdown` pada pool yang sudah berhenti, dan `Close` yang dipanggil dua kali
+  pada setiap tipe.
+- Handler yang panic menjadi `ErrHandlerPanic` alih-alih membunuh pool.
+- `Publish` di bawah policy `Block` terbuka saat bus ditutup.
 
 ---
 
-## Project layout
+## Struktur project
 
 ```
-dispatch/
-├── cmd/dispatchd/        demo service: wiring, HTTP, signal handling
-├── docs/DESIGN.md        deep design notes and trade-off narrative
-├── eventbus/             topic-pattern pub/sub
-├── queue/                priority queue + delivery semantics
+go-dispatch/
+├── cmd/dispatchd/        demo service: wiring, HTTP, penanganan signal
+├── docs/DESIGN.md        catatan desain mendalam dan narasi trade-off
+├── eventbus/             pub/sub dengan pola topik
+├── queue/                priority queue + semantik pengiriman
 ├── ratelimit/            token bucket, fixed window, Multi, Keyed
-└── worker/               bounded worker pool + graceful drain
+└── worker/               worker pool berbatas + graceful drain
 ```
 
-The README is the tour; [`docs/DESIGN.md`](docs/DESIGN.md) is the deep end —
-invariants, the failure taxonomy, the bugs the tests caught, and what a durable
-backend would have to change.
+README ini adalah tur singkatnya; [`docs/DESIGN.md`](docs/DESIGN.md) adalah bagian
+dalamnya — invariant, taksonomi kegagalan, bug yang ditangkap test, dan apa yang
+harus diubah untuk backend yang durable.
 
-Total: ~6,700 lines including tests, across 27 files.
+Total: ~6,700 baris termasuk test, tersebar di 27 file.
 
-### `dispatchd` flags
+### Flag `dispatchd`
 
-| Flag | Default | Meaning |
+| Flag | Default | Arti |
 | --- | --- | --- |
-| `-workers` | `8` | Concurrent job runners |
-| `-rate` | `200` | Max job starts/sec (`0` disables the limiter) |
-| `-burst` | `50` | Limiter burst capacity |
-| `-addr` | `:8080` | HTTP listen address |
-| `-subjects` | `2000` | Jobs to generate at startup |
-| `-shutdown-timeout` | `10s` | Graceful drain deadline |
+| `-workers` | `8` | Jumlah job runner konkuren |
+| `-rate` | `200` | Maksimum job yang dimulai per detik (`0` menonaktifkan limiter) |
+| `-burst` | `50` | Kapasitas burst limiter |
+| `-addr` | `:8080` | Alamat HTTP untuk listen |
+| `-subjects` | `2000` | Jumlah job yang digenerate saat start |
+| `-shutdown-timeout` | `10s` | Batas waktu graceful drain |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
-| `-healthcheck` | _(off)_ | Probe this URL and exit 0/1 instead of serving |
+| `-healthcheck` | _(off)_ | Probe URL ini lalu keluar 0/1 alih-alih melayani |
 
-`-healthcheck` exists because the container image is `FROM scratch` and contains
-no `curl` or `wget` to shell out to. The binary probes itself instead:
+`-healthcheck` ada karena image container-nya `FROM scratch` dan tidak memuat
+`curl` maupun `wget` untuk dipanggil. Binary-nya memeriksa dirinya sendiri:
 
 ```
 $ dispatchd -healthcheck=http://127.0.0.1:8080/healthz && echo alive
 alive
 ```
 
-The demo generates four job kinds — `email.send`, `image.resize`, `slow.index`,
-and `flaky.report` (which fails intermittently, to exercise the retry and
-dead-letter paths). Every queue transition is bridged onto the event bus and
-logged.
+Demo-nya menghasilkan empat jenis job — `email.send`, `image.resize`, `slow.index`,
+dan `flaky.report` (yang gagal secara berkala, untuk menguji jalur retry dan
+dead-letter). Setiap transisi queue dijembatani ke event bus dan dicatat.
 
-Shutdown order is deliberate: stop the HTTP listener, then drain the pool so no
-job is cut off mid-flight, then close the bus **last** so the final state
-transitions still get published.
+Urutan shutdown-nya disengaja: hentikan listener HTTP, lalu drain pool agar tidak
+ada job yang terpotong di tengah jalan, lalu tutup bus **terakhir** agar transisi
+status terakhir tetap terpublikasikan.
 
 ---
 
 ## Roadmap
 
-The interfaces are the interesting part; these are the backends they were shaped
-for.
+Interface-nya adalah bagian yang menarik; inilah backend-backend yang menjadi
+alasan bentuknya seperti sekarang.
 
-- [ ] **`queue.Backend`**: extract storage behind an interface and add a Redis
-      implementation (delayed set + lock-based reservations) and a Postgres one
-      (`FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY`).
-- [ ] **Idempotency keys** so an at-least-once consumer can deduplicate retries.
-- [ ] **Fair scheduling**: per-tenant queues with weighted round-robin instead of
-      one global priority heap.
-- [ ] **Adaptive visibility timeouts**: extend a reservation automatically when a
-      handler reports progress, instead of relying on a fixed `Extend`.
-- [ ] **Structured tracing**: propagate `traceparent` through `Entry.Payload`
-      metadata so a job's retries appear as one trace.
-- [ ] **Prometheus metrics exporter** for the counters `Stats()` already exposes.
+- [ ] **`queue.Backend`**: ekstrak penyimpanan ke balik sebuah interface lalu
+      tambahkan implementasi Redis (delayed set + reservation berbasis lock) dan
+      Postgres (`FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY`).
+- [ ] **Idempotency key** agar consumer at-least-once bisa melakukan deduplikasi
+      retry.
+- [ ] **Fair scheduling**: queue per-tenant dengan weighted round-robin alih-alih
+      satu priority heap global.
+- [ ] **Adaptive visibility timeout**: perpanjang reservation secara otomatis saat
+      handler melaporkan kemajuan, alih-alih bergantung pada `Extend` yang tetap.
+- [ ] **Structured tracing**: propagasikan `traceparent` lewat metadata
+      `Entry.Payload` agar retry sebuah job muncul sebagai satu trace.
+- [ ] **Prometheus metrics exporter** untuk counter yang sudah diekspos `Stats()`.

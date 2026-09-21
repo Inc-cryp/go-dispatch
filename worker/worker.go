@@ -25,8 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Inc-cryp/dispatch/queue"
-	"github.com/Inc-cryp/dispatch/ratelimit"
+	"github.com/Inc-cryp/go-dispatch/queue"
+	"github.com/Inc-cryp/go-dispatch/ratelimit"
 )
 
 // Errors returned by pool operations.

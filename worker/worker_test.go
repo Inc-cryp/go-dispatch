@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Inc-cryp/dispatch/queue"
-	"github.com/Inc-cryp/dispatch/ratelimit"
+	"github.com/Inc-cryp/go-dispatch/queue"
+	"github.com/Inc-cryp/go-dispatch/ratelimit"
 )
 
 // fakeSink is a scriptable Sink. A real queue cannot be made to fail Ack or

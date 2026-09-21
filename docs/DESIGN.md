@@ -1,116 +1,123 @@
-# Design notes
+# Catatan desain
 
-The README is the tour. This is the deep end: the invariants each package
-maintains, why the current shape was chosen over the obvious alternative, and
-where the design knowingly gives something up.
+README adalah tur singkatnya. Ini bagian dalamnya: invariant yang dijaga setiap
+package, kenapa bentuk yang sekarang dipilih alih-alih alternatif yang kelihatan
+jelas, dan di mana desainnya sengaja mengorbankan sesuatu.
 
-Read the README first. Nothing here is required to use the library.
-
----
-
-## Table of contents
-
-1. [The core problem](#1-the-core-problem)
-2. [`queue`: ownership and time](#2-queue-ownership-and-time)
-3. [`worker`: two contexts, one shutdown](#3-worker-two-contexts-one-shutdown)
-4. [`ratelimit`: correctness under denial](#4-ratelimit-correctness-under-denial)
-5. [`eventbus`: matching and backpressure](#5-eventbus-matching-and-backpressure)
-6. [Failure taxonomy](#6-failure-taxonomy)
-7. [Bugs found by the verification pass](#7-bugs-found-by-the-verification-pass)
-8. [What would change for a real distributed backend](#8-what-would-change-for-a-real-distributed-backend)
-9. [Testing strategy](#9-testing-strategy)
+Baca README dulu. Tidak ada apa pun di sini yang diperlukan untuk memakai library
+ini.
 
 ---
 
-## 1. The core problem
+## Daftar isi
 
-A job queue is a state machine over time, and every hard bug in one comes from
-two questions that look easy:
-
-1. **Who owns a job right now?** The moment a job is handed to a worker, the
-   queue has lost the ability to observe it. If the worker dies, the queue must
-   eventually notice — but it cannot distinguish "still working" from "dead"
-   without a lease.
-2. **What happens when time passes?** A lease expiring and a scheduled retry
-   becoming due are the same kind of event: a deadline in the future that
-   changes a job's state. They must not be handled by two different mechanisms,
-   or the ordering between them becomes unobservable.
-
-`dispatch` answers (1) with a **visibility timeout** — a delivery is a lease with
-a deadline, and the queue re-arms the job when the deadline passes — and (2) with
-a **single scheduler goroutine** that owns every time-driven transition. Those
-two decisions cascade into most of the rest of the design.
-
-The alternative shape, which this codebase deliberately avoids, is a background
-goroutine per job or per reservation. It is easier to write and much harder to
-reason about: goroutine count becomes proportional to in-flight work, shutdown
-becomes a fan-in over an unbounded set, and two timers racing to requeue the same
-job produce duplicate deliveries. One scheduler makes the goroutine count a
-constant and the ordering total.
+1. [Masalah inti](#1-masalah-inti)
+2. [`queue`: kepemilikan dan waktu](#2-queue-kepemilikan-dan-waktu)
+3. [`worker`: dua context, satu shutdown](#3-worker-dua-context-satu-shutdown)
+4. [`ratelimit`: kebenaran saat penolakan](#4-ratelimit-kebenaran-saat-penolakan)
+5. [`eventbus`: pencocokan dan backpressure](#5-eventbus-pencocokan-dan-backpressure)
+6. [Taksonomi kegagalan](#6-taksonomi-kegagalan)
+7. [Bug yang ditemukan saat proses verifikasi](#7-bug-yang-ditemukan-saat-proses-verifikasi)
+8. [Apa yang akan berubah untuk backend terdistribusi sungguhan](#8-apa-yang-akan-berubah-untuk-backend-terdistribusi-sungguhan)
+9. [Strategi testing](#9-strategi-testing)
 
 ---
 
-## 2. `queue`: ownership and time
+## 1. Masalah inti
 
-### 2.1 The scheduler is the only clock
+Job queue adalah state machine atas waktu, dan setiap bug sulit di dalamnya
+berasal dari dua pertanyaan yang kelihatan mudah:
 
-`queue.New` starts exactly one scheduler goroutine. It is the sole writer of
-delayed-delivery and visibility state. Producers and consumers take a mutex to
-touch the heap, but *time* belongs to the scheduler alone.
+1. **Siapa yang memiliki sebuah job saat ini?** Begitu sebuah job diserahkan ke
+   worker, queue kehilangan kemampuan mengamatinya. Jika worker-nya mati, queue
+   harus pada akhirnya menyadarinya — tetapi ia tidak bisa membedakan "masih
+   bekerja" dari "sudah mati" tanpa sebuah lease.
+2. **Apa yang terjadi saat waktu berlalu?** Lease yang kedaluwarsa dan retry
+   terjadwal yang menjadi jatuh tempo adalah jenis event yang sama: sebuah deadline
+   di masa depan yang mengubah status sebuah job. Keduanya tidak boleh ditangani
+   oleh dua mekanisme berbeda, atau urutan di antara keduanya menjadi tak
+   teramati.
 
-The scheduler computes the earliest pending deadline (next delayed job's `RunAt`,
-next reservation's expiry) and sleeps until then. When it wakes it drains
-everything that is now due. Waking late is harmless — readiness is decided by
-comparing timestamps, not by trusting the wakeup — so there is no correctness
-dependence on timer accuracy. `WithPollInterval` exists as a floor for how long
-the scheduler will sleep, which bounds latency for tests that want fast
-turnaround.
+`dispatch` menjawab (1) dengan **visibility timeout** — sebuah delivery adalah
+lease dengan deadline, dan queue mempersenjatai ulang job tersebut ketika
+deadline-nya lewat — dan (2) dengan **satu goroutine scheduler** yang memiliki
+setiap transisi yang digerakkan waktu. Kedua keputusan itu merambat ke sebagian
+besar desain sisanya.
 
-**Why this matters:** because a single goroutine applies every time-driven
-transition, there is no interleaving in which two timers race to requeue the same
-job. Duplicate delivery then becomes a property of the *lease protocol* alone,
-which is a much smaller surface to test.
+Bentuk alternatifnya, yang sengaja dihindari codebase ini, adalah goroutine latar
+belakang per job atau per reservation. Ia lebih mudah ditulis dan jauh lebih sulit
+dicerna: jumlah goroutine menjadi sebanding dengan pekerjaan yang sedang melayang,
+shutdown menjadi fan-in atas himpunan tak berbatas, dan dua timer yang berlomba
+me-requeue job yang sama menghasilkan delivery duplikat. Satu scheduler membuat
+jumlah goroutine menjadi konstanta dan urutannya total.
 
-### 2.2 Reservation, not removal
+---
 
-`Dequeue` does not remove a job. It records a reservation with a deadline and
-returns a `Delivery`:
+## 2. `queue`: kepemilikan dan waktu
+
+### 2.1 Scheduler adalah satu-satunya jam
+
+`queue.New` menjalankan tepat satu goroutine scheduler. Ia satu-satunya penulis
+delayed-delivery dan visibility state. Producer dan consumer mengambil mutex untuk
+menyentuh heap, tetapi *waktu* hanya milik scheduler.
+
+Scheduler menghitung deadline tertunda paling awal (`RunAt` job tertunda
+berikutnya, kedaluwarsa reservation berikutnya) lalu tidur sampai saat itu. Ketika
+ia bangun, ia menguras semua yang sudah jatuh tempo. Bangun terlambat itu tidak
+berbahaya — kesiapan ditentukan dengan membandingkan timestamp, bukan dengan
+mempercayai wakeup-nya — jadi tidak ada ketergantungan kebenaran pada akurasi
+timer. `WithPollInterval` ada sebagai batas bawah berapa lama scheduler akan
+tidur, yang membatasi latency untuk test yang menginginkan turnaround cepat.
+
+**Kenapa ini penting:** karena satu goroutine menerapkan setiap transisi yang
+digerakkan waktu, tidak ada interleaving di mana dua timer berlomba me-requeue job
+yang sama. Delivery duplikat lalu menjadi properti dari *protokol lease* semata,
+yang merupakan permukaan yang jauh lebih kecil untuk di-test.
+
+### 2.2 Reservation, bukan penghapusan
+
+`Dequeue` tidak menghapus sebuah job. Ia mencatat reservation dengan sebuah
+deadline lalu mengembalikan `Delivery`:
 
 ```
 Delivery{ Job: Entry, Attempt: int, Deadline: time.Time, token }
 ```
 
-`Ack` retires the job. `Nack` either schedules a retry or dead-letters it.
-`Extend` pushes the deadline out. If none of those arrive before `Deadline`, the
-scheduler returns the job to the ready set — **without consuming an attempt**.
+`Ack` memensiunkan job. `Nack` entah menjadwalkan retry atau melakukan
+dead-letter. `Extend` mendorong deadline-nya lebih jauh. Jika tidak ada dari
+semuanya yang datang sebelum `Deadline`, scheduler mengembalikan job ke ready set
+— **tanpa menghabiskan satu attempt**.
 
-That last clause is a deliberate choice. A lapsed reservation means the worker
-never reported back: it may have crashed, or it may be hung, or the machine may
-have been suspended. Charging an attempt for a verdict nobody delivered would let
-an unlucky worker burn a job's entire retry budget without the handler ever
-running to completion. So lapses are free, and only an explicit `Nack` consumes
-an attempt.
+Klausa terakhir itu adalah pilihan yang disengaja. Reservation yang kedaluwarsa
+berarti worker tidak pernah melapor kembali: bisa jadi ia crash, bisa jadi ia
+macet, atau mesinnya mungkin di-suspend. Menagih satu attempt untuk vonis yang
+tidak pernah disampaikan akan membiarkan worker yang kurang beruntung menghabiskan
+seluruh anggaran retry sebuah job tanpa handler-nya pernah selesai berjalan. Jadi
+reservation yang kedaluwarsa itu gratis, dan hanya `Nack` eksplisit yang
+menghabiskan satu attempt.
 
-The cost: a job whose handler reliably outlives its visibility timeout will be
-redelivered forever. That is a real pathology, and the honest fix is a bounded
-attempt counter that counts *deliveries* as well as verdicts. It is not
-implemented, because the semantics get confusing quickly (what does a redelivery
-of a job with `MaxAttempts: 1` mean?) and the current behavior is at least
-defensible: **a job is only punished for a verdict it produced.**
+Biayanya: job yang handler-nya secara konsisten hidup lebih lama dari visibility
+timeout-nya akan dikirim ulang selamanya. Itu patologi nyata, dan perbaikan yang
+jujur adalah attempt counter berbatas yang menghitung *delivery* sekaligus vonis.
+Ia tidak diimplementasikan, karena semantiknya cepat membingungkan (apa arti
+pengiriman ulang job dengan `MaxAttempts: 1`?) dan perilaku saat ini setidaknya
+bisa dipertahankan: **sebuah job hanya dihukum karena vonis yang ia hasilkan.**
 
-### 2.3 The zero-time sentinel
+### 2.3 Sentinel zero-time
 
-Immediate jobs are normalized to a zero `RunAt`, not `time.Now()`.
+Job yang sifatnya immediate dinormalkan ke `RunAt` bernilai nol, bukan
+`time.Now()`.
 
-This looks like a micro-optimization and is actually a correctness fix. When
-every entry carried its own `time.Now()`, the ready heap's `(priority, readyAt,
-seq)` ordering was decided by the timestamp for every same-priority pair, and
-`seq` — the monotonic enqueue counter that exists precisely to break ties — only
-ever fired when two timestamps were bit-identical. `TestPriorityOrdering` caught
-this. Normalizing to a sentinel makes `seq` the actual tiebreaker, so FIFO
-ordering within a priority class is guaranteed rather than probabilistic.
+Ini kelihatan seperti micro-optimization dan sebenarnya adalah perbaikan
+kebenaran. Ketika setiap entry membawa `time.Now()` miliknya sendiri, ordering
+ready heap `(priority, readyAt, seq)` ditentukan oleh timestamp untuk setiap
+pasangan berprioritas sama, dan `seq` — counter enqueue monotonik yang ada justru
+untuk memecah seri — hanya pernah menyala ketika dua timestamp identik bit-per-bit.
+`TestPriorityOrdering` menangkap ini. Menormalkan ke sentinel membuat `seq` menjadi
+tiebreaker yang sesungguhnya, sehingga urutan FIFO di dalam satu kelas prioritas
+dijamin alih-alih bersifat probabilistik.
 
-### 2.4 Backoff caps after jitter
+### 2.4 Backoff memberi cap setelah jitter
 
 ```go
 delay := base * (1 << (attempt - 1))   // exponential
@@ -118,167 +125,181 @@ delay += jitter(delay)                 // full jitter
 if delay > max { delay = max }         // cap LAST
 ```
 
-The cap is applied after the jitter, not before. Applying it first lets the
-jitter push the result past the ceiling, so the documented maximum is exceeded
-exactly for the late attempts where it matters most. The second real bug the
-tests found. Full jitter (uniform in `[0, delay)`) rather than decorrelated
-jitter is a simplicity call: at a 30-second ceiling with a handful of retries,
-the thundering-herd argument for the fancier variants does not bite.
+Cap diterapkan setelah jitter, bukan sebelumnya. Menerapkannya lebih dulu membuat
+jitter bisa mendorong hasilnya melewati plafon, sehingga maksimum yang
+didokumentasikan terlampaui justru pada attempt-attempt akhir di mana itu paling
+penting. Bug nyata kedua yang ditemukan test. Full jitter (uniform pada
+`[0, delay)`) alih-alih decorrelated jitter adalah pilihan kesederhanaan: pada
+plafon 30 detik dengan segelintir retry, argumen thundering-herd untuk varian yang
+lebih canggih tidak menggigit.
 
-### 2.5 A single global mutex, on purpose
+### 2.5 Satu mutex global, dengan sengaja
 
-The queue uses one `sync.Mutex` for all state. Contention is not the bottleneck
-at the scale this is designed for, and the alternative — sharded locks or
-lock-free structures — multiplies the number of orderings a reviewer has to
-verify. When the backend is swapped for a real store, this mutex disappears
-entirely and is replaced by the store's concurrency control, so optimizing it now
-would be optimizing code that is scheduled for deletion.
-
----
-
-## 3. `worker`: two contexts, one shutdown
-
-### 3.1 The split
-
-`Start(ctx)` derives a *dispatch* context but passes the caller's original `ctx`
-to handlers. This is the single most consequential decision in the package.
-
-- The **dispatch context** gates `Dequeue` and limiter waits. Cancelling it
-  unblocks a dispatcher parked on an empty queue immediately, instead of making
-  shutdown wait for the poll interval or the caller's deadline.
-- The **handler context** is the caller's context, untouched. A graceful
-  `Shutdown` does **not** cancel it, so an in-flight job gets to finish.
-
-Conflating them yields one of two bugs depending on which way the cancellation
-propagates: either shutdown returns while handlers are still mutating state (work
-lost), or shutdown blocks until every handler completes no matter how long that
-takes (unbounded drain). Splitting them lets the pool stop *pulling* work while
-in-flight work proceeds under the operator's own signal context — in
-`cmd/dispatchd`, the `SIGTERM` context.
-
-`Shutdown` is idempotent and bounded by `WithDrainTimeout`. On expiry it returns
-an error wrapping `context.DeadlineExceeded`, and abandoned jobs fall back to the
-queue's visibility timeout. That is the honest outcome; the alternative is an
-unbounded wait.
-
-### 3.2 `applyNack` is the only interpreter of `Nack`'s answer
-
-`Nack` returning `ErrRetryScheduled` means **the retry was scheduled** — a
-success. Two call sites nack: the ordinary failure path and the
-interrupted-by-shutdown path. When each interpreted the result independently,
-the shutdown path logged `ErrRetryScheduled` as `nack during shutdown failed`,
-making every healthy graceful shutdown look like data loss at exactly the moment
-an operator is watching.
-
-`applyNack` now centralizes the interpretation: `ErrRetryScheduled` →
-`RetryScheduled` + `retried` counter + debug log; `ErrJobFailed` → `DeadLettered`
-+ `dead` counter + error log; `ErrUnknownJob` → a warn that the reservation
-lapsed; anything else → an error. Both paths call it, so they cannot drift.
-
-### 3.3 Failure accounting, stated narrowly
-
-A job counts as **succeeded** only when the handler returned nil *and* the `Ack`
-was accepted. A failed `Ack` means the reservation lapsed and the job will be
-redelivered; counting it as a success would overstate throughput on exactly the
-runs where the worker was too slow. `Processed` counts verdicts, not deliveries,
-so a redelivered job is counted twice — which is why `Succeeded`, `Failed`,
-`Retried`, and `Dead` are exposed separately rather than collapsed.
-
-### 3.4 Panics are contained
-
-`safeHandle` converts a handler panic into `ErrHandlerPanic` wrapping the job ID,
-so the job is nacked and retried like any other failure. `safeNotify` extends the
-same containment to `OnResult`. The pool's contract is to survive a panicking
-handler: losing the goroutine would silently and permanently reduce capacity.
-
-`New` panics on a nil `Sink` or nil handler. A nil handler silently replaced by a
-no-op is the worst possible default — every job succeeds while doing nothing —
-and that is a programming error, so it fails at construction.
+Queue memakai satu `sync.Mutex` untuk seluruh state. Contention bukan bottleneck
+pada skala yang jadi sasaran desain ini, dan alternatifnya — sharded lock atau
+struktur lock-free — melipatgandakan jumlah ordering yang harus diverifikasi
+seorang reviewer. Ketika backend-nya ditukar dengan store sungguhan, mutex ini
+hilang sepenuhnya dan digantikan oleh concurrency control milik store tersebut,
+jadi mengoptimalkannya sekarang berarti mengoptimalkan kode yang sudah dijadwalkan
+untuk dihapus.
 
 ---
 
-## 4. `ratelimit`: correctness under denial
+## 3. `worker`: dua context, satu shutdown
 
-### 4.1 Lazy refill, no goroutines
+### 3.1 Pemisahannya
 
-A token bucket refills by arithmetic:
+`Start(ctx)` menurunkan sebuah context *dispatch* tetapi meneruskan `ctx` asli
+milik pemanggil ke handler. Ini keputusan paling berkonsekuensi di package ini.
+
+- **Context dispatch** menggerbangi `Dequeue` dan penantian limiter.
+  Membatalkannya langsung melepaskan dispatcher yang sedang terparkir pada queue
+  kosong, alih-alih membuat shutdown menunggu poll interval atau deadline milik
+  pemanggil.
+- **Context handler** adalah context milik pemanggil, tak tersentuh. `Shutdown`
+  yang graceful **tidak** membatalkannya, sehingga job yang sedang melayang bisa
+  selesai.
+
+Mencampur keduanya menghasilkan salah satu dari dua bug tergantung ke arah mana
+pembatalannya merambat: entah shutdown kembali selagi handler masih mengubah
+state (pekerjaan hilang), atau shutdown terblokir sampai setiap handler selesai
+tak peduli berapa lama (drain tak berbatas). Memisahkannya membuat pool bisa
+berhenti *menarik* pekerjaan sementara pekerjaan yang melayang tetap berjalan di
+bawah signal context milik operator — di `cmd/dispatchd`, context `SIGTERM`.
+
+`Shutdown` bersifat idempotent dan dibatasi oleh `WithDrainTimeout`. Saat
+kedaluwarsa ia mengembalikan error yang membungkus `context.DeadlineExceeded`, dan
+job yang ditinggalkan jatuh kembali ke visibility timeout milik queue. Itulah
+hasil yang jujur; alternatifnya adalah penantian tak berbatas.
+
+### 3.2 `applyNack` adalah satu-satunya penafsir jawaban `Nack`
+
+`Nack` yang mengembalikan `ErrRetryScheduled` berarti **retry-nya sudah
+dijadwalkan** — sebuah sukses. Ada dua call site yang memanggil nack: jalur
+kegagalan biasa dan jalur yang terinterupsi shutdown. Ketika masing-masing
+menafsirkan hasilnya secara independen, jalur shutdown mencatat `ErrRetryScheduled`
+sebagai `nack during shutdown failed`, membuat setiap graceful shutdown yang sehat
+terlihat seperti kehilangan data tepat pada saat operator sedang mengamati.
+
+`applyNack` sekarang memusatkan penafsirannya: `ErrRetryScheduled` →
+`RetryScheduled` + counter `retried` + log debug; `ErrJobFailed` → `DeadLettered`
++ counter `dead` + log error; `ErrUnknownJob` → peringatan bahwa reservation-nya
+kedaluwarsa; apa pun selainnya → error. Kedua jalur memanggilnya, sehingga keduanya
+tidak bisa menyimpang.
+
+### 3.3 Akuntansi kegagalan, dinyatakan secara sempit
+
+Sebuah job dihitung sebagai **berhasil** hanya ketika handler mengembalikan nil
+*dan* `Ack`-nya diterima. `Ack` yang gagal berarti reservation-nya kedaluwarsa dan
+job-nya akan dikirim ulang; menghitungnya sebagai sukses akan melebih-lebihkan
+throughput justru pada run-run di mana worker-nya terlalu lambat. `Processed`
+menghitung vonis, bukan delivery, jadi job yang dikirim ulang dihitung dua kali —
+itulah sebabnya `Succeeded`, `Failed`, `Retried`, dan `Dead` diekspos terpisah
+alih-alih digabung.
+
+### 3.4 Panic ditahan
+
+`safeHandle` mengubah panic di handler menjadi `ErrHandlerPanic` yang membungkus
+job ID, sehingga job-nya di-nack dan di-retry seperti kegagalan lain.
+`safeNotify` memperluas penahanan yang sama ke `OnResult`. Kontrak pool-nya adalah
+bertahan terhadap handler yang panic: kehilangan goroutine-nya akan mengurangi
+kapasitas secara senyap dan permanen.
+
+`New` panic pada `Sink` atau handler yang nil. Handler nil yang diam-diam diganti
+dengan no-op adalah default terburuk yang mungkin — setiap job "berhasil" sambil
+tidak melakukan apa pun — dan itu kesalahan pemrograman, jadi ia gagal pada waktu
+konstruksi.
+
+---
+
+## 4. `ratelimit`: kebenaran saat penolakan
+
+### 4.1 Pengisian ulang lazy, tanpa goroutine
+
+Token bucket mengisi ulang secara aritmetik:
 
 ```go
 elapsed := now.Sub(b.last)
 b.tokens = min(b.burst, b.tokens + elapsed.Seconds()*b.rate)
 ```
 
-No background goroutine, no per-limiter timer. Cost is O(1) per call and
-proportional to the number of limiters, not to tokens or wall-clock time. A
-process holding ten thousand mostly-idle limiters pays nothing for them, which
-would be false for a ticker-per-bucket design. Time comes from `WithClock`, so
-every refill is deterministic in tests; nothing sleeps except `Wait`.
+Tanpa goroutine latar belakang, tanpa timer per limiter. Biayanya O(1) per
+panggilan dan sebanding dengan jumlah limiter, bukan dengan token atau waktu wall
+clock. Proses yang memegang sepuluh ribu limiter yang mayoritas menganggur tidak
+membayar apa pun untuknya, yang akan salah untuk desain ticker-per-bucket. Waktu
+berasal dari `WithClock`, sehingga setiap pengisian ulang deterministik di test;
+tidak ada yang tidur kecuali `Wait`.
 
-### 4.2 `Wait` checks the context before consuming
+### 4.2 `Wait` memeriksa context sebelum menghabiskan
 
-`Wait` on an already-cancelled context returns `ctx.Err()` **without consuming a
-token**. This was a fail-open bug found by the verification pass: the original
-loop reserved first and checked the context second, so a cancelled caller burned
-capacity it would never use, silently shrinking the effective rate for everyone
-else under load.
+`Wait` pada context yang sudah dibatalkan mengembalikan `ctx.Err()` **tanpa
+menghabiskan token**. Ini bug fail-open yang ditemukan saat proses verifikasi:
+loop aslinya me-reserve dulu dan memeriksa context belakangan, sehingga pemanggil
+yang dibatalkan menghabiskan kapasitas yang tidak akan pernah ia pakai, diam-diam
+mengecilkan rate efektif bagi semua orang lain saat beban tinggi.
 
-Fixing it introduced a second bug — a `d := l.Reserve()` shadowing the outer
-reservation, making the loop re-reserve on every pass. Both are pinned by tests,
-because both only appear under contention.
+Memperbaikinya memunculkan bug kedua — `d := l.Reserve()` yang menaungi
+reservation luarnya, membuat loop me-reserve ulang di setiap putaran. Keduanya
+dikunci oleh test, karena keduanya hanya muncul saat contention.
 
-### 4.3 `Keyed` is not a `Limiter`, deliberately
+### 4.3 `Keyed` bukan `Limiter`, dengan sengaja
 
-`TokenBucket`, `FixedWindow`, and `Multi` implement `Limiter` — no key, one
-budget. `Keyed` requires a key, so its methods are `Allow(key)`,
-`Reserve(key)`, and `Wait(ctx, key)`, and it does **not** implement `Limiter`.
+`TokenBucket`, `FixedWindow`, dan `Multi` mengimplementasikan `Limiter` — tanpa
+key, satu anggaran. `Keyed` memerlukan key, jadi method-nya adalah `Allow(key)`,
+`Reserve(key)`, dan `Wait(ctx, key)`, dan ia **tidak** mengimplementasikan
+`Limiter`.
 
-If it did, an unkeyed call would have to fail open (allow everything) or fail
-closed (deny everything). Both are silent catastrophes for a rate limiter, so the
-API makes the unkeyed call a **compile** error instead. `TestKeyedIsNotALimiter`
-asserts the type relationship that keeps this true.
+Jika ia mengimplementasikannya, panggilan tanpa key harus gagal secara fail-open
+(izinkan semuanya) atau fail-closed (tolak semuanya). Keduanya adalah bencana
+senyap bagi sebuah rate limiter, jadi API-nya justru membuat panggilan tanpa key
+menjadi error **compile**. `TestKeyedIsNotALimiter` menegaskan relasi tipe yang
+menjaga hal ini tetap benar.
 
-`Keyed` bounds its key space (`maxKeys`) with eviction, so an attacker supplying
-fresh keys cannot grow memory without limit. That is a real trade-off: evicting a
-key resets its budget, so an attacker who can rotate keys *and* trigger eviction
-gets a partial bypass. A production system would evict by LRU with a minimum
-residency. Documented, not hidden.
+`Keyed` membatasi ruang key-nya (`maxKeys`) dengan eviction, sehingga penyerang
+yang memasok key-key baru tidak bisa menumbuhkan memori tanpa batas. Itu trade-off
+nyata: meng-evict sebuah key me-reset anggarannya, jadi penyerang yang bisa
+merotasi key *dan* memicu eviction mendapat bypass parsial. Sistem produksi akan
+melakukan evict berdasarkan LRU dengan masa tinggal minimum. Didokumentasikan,
+bukan disembunyikan.
 
-### 4.4 Invalid arguments are clamped
+### 4.4 Argumen tidak valid di-clamp
 
-A negative rate, a zero burst, a non-positive window — each is clamped to a sane
-minimum rather than panicking. Configuration arriving from flags or the
-environment should not be able to crash the process at construction. `Multi`
-compounds this: `Reserve` returns the **maximum** of its children's waits,
-because every child must be satisfied.
+Rate negatif, burst nol, window yang tidak positif — masing-masing di-clamp ke
+minimum yang wajar alih-alih panic. Konfigurasi yang datang dari flag atau
+environment seharusnya tidak bisa membuat prosesnya crash pada waktu konstruksi.
+`Multi` memperkuat ini: `Reserve` mengembalikan penantian **maksimum** dari
+anak-anaknya, karena setiap anak harus terpenuhi.
 
 ---
 
-## 5. `eventbus`: matching and backpressure
+## 5. `eventbus`: pencocokan dan backpressure
 
-### 5.1 Matching semantics
+### 5.1 Semantik pencocokan
 
-Patterns are dot-separated with `*` (exactly one segment) and `>` (one or more
-remaining segments, legal only as the final segment). `job.>` matches
-`job.created` but not the bare topic `job` — "one or more" rather than "zero or
-more", because a bare-topic match is almost never what the author meant and
-silently subscribing to more than intended is worse than matching nothing.
+Pattern dipisahkan titik dengan `*` (tepat satu segmen) dan `>` (satu atau lebih
+segmen tersisa, sah hanya sebagai segmen terakhir). `job.>` cocok dengan
+`job.created` tetapi tidak dengan topik telanjang `job` — "satu atau lebih"
+alih-alih "nol atau lebih", karena kecocokan topik telanjang hampir tidak pernah
+yang dimaksud penulisnya dan berlangganan lebih banyak dari yang diniatkan secara
+senyap itu lebih buruk daripada tidak mencocokkan apa pun.
 
-### 5.2 `Publish` is synchronous; handlers are not
+### 5.2 `Publish` sinkron; handler-nya tidak
 
-`Publish` matches subscriptions and delivers to each subscriber's buffered
-channel *before returning*. Handler execution happens on the subscriber's own
-worker goroutines. `PublishSync` waits for handlers, for callers whose next
-statement depends on the event having been observed.
+`Publish` mencocokkan subscription dan mengirim ke buffered channel milik setiap
+subscriber *sebelum kembali*. Eksekusi handler terjadi pada goroutine worker milik
+subscriber itu sendiri. `PublishSync` menunggu handler, untuk pemanggil yang
+pernyataan berikutnya bergantung pada event yang sudah teramati.
 
-`matching()` snapshots the subscriber set under the bus lock and **releases it
-before delivering**. Under `DropPolicy: Block` a channel send can wait
-indefinitely, and holding the bus lock across it would let one slow subscriber
-stall every publisher in the process. The snapshot is safe because removal is
-coordinated through the subscriber's own lock.
+`matching()` mengambil snapshot himpunan subscriber di bawah lock bus lalu
+**melepasnya sebelum mengirim**. Di bawah `DropPolicy: Block` sebuah pengiriman
+channel bisa menunggu tanpa batas, dan memegang lock bus sepanjang itu akan
+membuat satu subscriber lambat menahan setiap publisher di proses tersebut.
+Snapshot-nya aman karena penghapusan dikoordinasikan lewat lock milik subscriber
+itu sendiri.
 
-### 5.3 The send-on-closed-channel problem
+### 5.3 Masalah send-on-closed-channel
 
-The classic Go footgun, resolved with three pieces of state:
+Footgun klasik Go, diselesaikan dengan tiga potong state:
 
 ```go
 sendMu  sync.RWMutex
@@ -286,135 +307,141 @@ closed  bool
 closing chan struct{}
 ```
 
-`Subscription.Close` closes `s.closing`, removes the subscription from the bus,
-then takes `sendMu.Lock()` and closes `s.ch` exactly once. A publisher holds
-`sendMu.RLock()` across its send, so it either completes before the closer takes
-the write lock or observes `closing` closed and gives up. No send ever races a
-close.
+`Subscription.Close` menutup `s.closing`, menghapus subscription dari bus, lalu
+mengambil `sendMu.Lock()` dan menutup `s.ch` tepat sekali. Publisher memegang
+`sendMu.RLock()` sepanjang pengirimannya, sehingga ia entah selesai sebelum
+closer-nya mengambil write lock atau mengamati `closing` sudah tertutup lalu
+menyerah. Tidak ada pengiriman yang pernah berlomba dengan close.
 
-Bus `Close` is **drain-then-stop**: it closes subscriptions, letting buffered
-events reach handlers before their workers exit. `Subscribe` on a closed bus
-returns an already-closed subscription plus `ErrBusClosed`, so no caller ends up
-holding a live-looking handle on a dead bus.
+`Close` pada bus bersifat **drain-then-stop**: ia menutup subscription,
+membiarkan event yang ter-buffer mencapai handler sebelum worker-nya keluar.
+`Subscribe` pada bus yang sudah tertutup mengembalikan subscription yang sudah
+tertutup plus `ErrBusClosed`, sehingga tidak ada pemanggil yang akhirnya memegang
+handle yang kelihatan hidup pada bus yang mati.
 
-### 5.4 `DropNewest` is the default, and that is the point
+### 5.4 `DropNewest` adalah default-nya, dan itulah intinya
 
-The default drop policy discards the **incoming** event when a subscriber's
-buffer is full, rather than blocking the publisher. This is the opposite of what
-"reliable bus" usually implies, and it is deliberate: the bus is observational
-infrastructure sitting next to a queue that already provides the durable,
-retryable path. Blocking a producer on a logging subscriber is the worse failure.
-`WithDropPolicy(Block)` is available where backpressure is wanted, and `Dropped()`
-surfaces the count either way.
+Drop policy default membuang event yang **masuk** ketika buffer subscriber penuh,
+alih-alih memblokir publisher. Ini kebalikan dari apa yang biasanya tersirat oleh
+"reliable bus", dan memang disengaja: bus adalah infrastruktur observasional yang
+berada di samping queue yang sudah menyediakan jalur durable dan bisa di-retry.
+Memblokir producer karena subscriber logging adalah kegagalan yang lebih buruk.
+`WithDropPolicy(Block)` tersedia di tempat backpressure diinginkan, dan `Dropped()`
+memunculkan hitungannya dalam kedua kasus.
 
-**The rule that follows:** if an event must not be lost, it belongs in the queue,
-not on the bus.
+**Aturan yang mengikutinya:** jika sebuah event tidak boleh hilang, tempatnya di
+queue, bukan di bus.
 
 ---
 
-## 6. Failure taxonomy
+## 6. Taksonomi kegagalan
 
-Every package distinguishes "the caller did something wrong" from "the world did
-something wrong," because the responses differ.
+Setiap package membedakan "pemanggil melakukan kesalahan" dari "dunia luar
+melakukan kesalahan", karena responsnya berbeda.
 
-| Sentinel | Class | Meaning |
+| Sentinel | Kelas | Arti |
 | --- | --- | --- |
-| `queue.ErrClosed` | caller | The queue was closed; stop calling it |
-| `queue.ErrInvalidEntry` | caller | Missing ID or invalid field |
-| `queue.ErrUnknownJob` | world | Reservation lapsed; the job already moved on |
-| `queue.ErrRetryScheduled` | **success** | `Nack` scheduled a retry |
-| `queue.ErrJobFailed` | terminal | Attempts exhausted; dead-lettered |
-| `worker.ErrAlreadyStarted` | caller | `Start` called twice |
-| `worker.ErrPoolClosed` | caller | `Start` after `Shutdown` |
-| `worker.ErrNilContext` | caller | `Start(nil)` |
-| `worker.ErrHandlerPanic` | world | Handler panicked; job nacked |
-| `eventbus.ErrBusClosed` | caller | Bus closed |
-| `eventbus.ErrInvalidPattern` | caller | Malformed topic pattern |
-| `eventbus.ErrSubClosed` | caller | Subscription closed |
+| `queue.ErrClosed` | pemanggil | Queue sudah ditutup; berhenti memanggilnya |
+| `queue.ErrInvalidEntry` | pemanggil | ID hilang atau field tidak valid |
+| `queue.ErrUnknownJob` | dunia luar | Reservation kedaluwarsa; job-nya sudah bergerak |
+| `queue.ErrRetryScheduled` | **sukses** | `Nack` menjadwalkan sebuah retry |
+| `queue.ErrJobFailed` | terminal | Attempt habis; sudah dead-letter |
+| `worker.ErrAlreadyStarted` | pemanggil | `Start` dipanggil dua kali |
+| `worker.ErrPoolClosed` | pemanggil | `Start` setelah `Shutdown` |
+| `worker.ErrNilContext` | pemanggil | `Start(nil)` |
+| `worker.ErrHandlerPanic` | dunia luar | Handler panic; job di-nack |
+| `eventbus.ErrBusClosed` | pemanggil | Bus tertutup |
+| `eventbus.ErrInvalidPattern` | pemanggil | Pattern topik tidak valid |
+| `eventbus.ErrSubClosed` | pemanggil | Subscription tertutup |
 
-`ErrRetryScheduled` being a success value is the one that bites. Any code
-treating a non-nil `Nack` return as failure is wrong, and §3.2 exists because
-that mistake was made once already.
+`ErrRetryScheduled` sebagai nilai sukses adalah yang paling menggigit. Kode apa
+pun yang memperlakukan kembalian `Nack` yang non-nil sebagai kegagalan itu salah,
+dan §3.2 ada karena kesalahan itu sudah pernah terjadi sekali.
 
-Errors are wrapped with `%w` so `errors.Is` works through layers, and the
-shutdown drain error wraps `context.DeadlineExceeded` so a caller can treat it
-uniformly with any other deadline.
+Error dibungkus dengan `%w` agar `errors.Is` bekerja menembus lapisan-lapisan, dan
+error drain saat shutdown membungkus `context.DeadlineExceeded` agar pemanggil
+bisa memperlakukannya seragam dengan deadline lain mana pun.
 
 ---
 
-## 7. Bugs found by the verification pass
+## 7. Bug yang ditemukan saat proses verifikasi
 
-Recorded because they are the evidence the tests earn their keep. Every one was
-found by a test, not by reading.
+Dicatat karena inilah bukti bahwa test-nya membayar dirinya sendiri. Setiap
+satunya ditemukan oleh test, bukan dengan membaca.
 
-| Bug | Symptom | Fix |
+| Bug | Gejala | Perbaikan |
 | --- | --- | --- |
-| Priority ordering inert | `seq` never broke ties; ordering depended on clock resolution | Zero-time sentinel for immediate jobs |
-| Backoff ceiling exceeded | Cap applied before jitter, so late retries overshot the max | Cap after jitter |
-| `Wait` fail-open | Cancelled caller still consumed a token | Check `ctx.Err()` before and after `Allow` |
-| Shadowed reservation | Loop re-reserved every iteration after the fix above | Hoist `d := l.Reserve()` out of the loop |
-| `Keyed` API contradiction | Doc said keyed, stubs were unkeyed and failed open | Keyed signatures; `Limiter` deliberately not implemented |
-| Misleading shutdown log | Healthy shutdown logged `nack during shutdown failed` | `applyNack` shared by both paths |
-| `job` wrapper struct | Single-field struct with a dead `release func()` | Collapsed to `chan queue.Delivery` |
-| Benchmark ID collisions | `time.Now().UnixNano()` produced duplicate live IDs | `atomic.Uint64` counter |
-| Benchmark hang | Prefilled a fixed `1<<16` while `RunParallel` totalled `b.N` | Prefill exactly `b.N` |
-| Benchmark hang (2) | Frozen clock made `Wait` block once the burst was exhausted | `benchClock.step` advances on every read |
+| Urutan prioritas tidak bekerja | `seq` tidak pernah memecah seri; urutannya bergantung resolusi jam | Sentinel zero-time untuk job immediate |
+| Plafon backoff terlampaui | Cap diterapkan sebelum jitter, sehingga retry akhir melampaui maksimum | Cap setelah jitter |
+| `Wait` fail-open | Pemanggil yang dibatalkan tetap menghabiskan satu token | Periksa `ctx.Err()` sebelum dan sesudah `Allow` |
+| Reservation yang tertutupi | Loop me-reserve ulang setiap iterasi setelah perbaikan di atas | Angkat `d := l.Reserve()` keluar dari loop |
+| Kontradiksi API `Keyed` | Dokumentasi menyebut keyed, stub-nya tanpa key dan fail open | Signature keyed; `Limiter` sengaja tidak diimplementasikan |
+| Log shutdown menyesatkan | Shutdown yang sehat mencatat `nack during shutdown failed` | `applyNack` dipakai bersama kedua jalur |
+| Struct pembungkus `job` | Struct satu field dengan `release func()` yang mati | Diringkas menjadi `chan queue.Delivery` |
+| Tabrakan ID benchmark | `time.Now().UnixNano()` menghasilkan ID hidup yang duplikat | Counter `atomic.Uint64` |
+| Benchmark hang | Mengisi awal `1<<16` tetap sementara `RunParallel` menotal `b.N` | Isi awal tepat `b.N` |
+| Benchmark hang (2) | Clock yang beku membuat `Wait` memblokir begitu burst-nya habis | `benchClock.step` memajukan waktu di setiap pembacaan |
 
-The last one is worth generalizing: **a benchmark must not use a frozen clock
-where the code under test can block.** `BenchmarkWaitImmediate` passed at
-`-benchtime 50ms` (b.N ≈ burst, so it never had to wait) and hung the entire
-`-bench .` run at `100ms`. A frozen clock is only safe for denial paths that
-never block.
-
----
-
-## 8. What would change for a real distributed backend
-
-The interfaces were shaped by asking what an SQS/Redis/Postgres backend would
-need. Concretely:
-
-- **`queue.Backend`** behind the existing surface. Redis maps to a sorted set for
-  delayed jobs plus per-job locks for reservations; Postgres maps to
-  `FOR UPDATE SKIP LOCKED` plus `LISTEN/NOTIFY` for wakeups. Both change the
-  scheduler from "own the clock" to "ask the store what is due," which is why the
-  scheduler is isolated.
-- **Fencing tokens.** `Delivery.token` is an in-process `uint64`. Across
-  processes it must become a monotonic fencing token so a resurrected worker
-  cannot `Ack` a job another worker now owns. This is the change that most
-  affects the public API: `Ack` would need to fail loudly on a stale token rather
-  than return `ErrUnknownJob`.
-- **Idempotency keys.** At-least-once delivery is a contract the *consumer* must
-  honour. The queue can help by exposing a dedup key, but it cannot provide
-  exactly-once on its own.
-- **Bounded attempts for lapsed reservations.** §2.2's "lapses are free" rule
-  needs a companion counter, or a pathological job is immortal.
-- **Fair scheduling.** One global priority heap starves low-priority work under
-  sustained load. Per-tenant queues with weighted round-robin is the standard fix.
+Yang terakhir layak digeneralisasi: **sebuah benchmark tidak boleh memakai clock
+yang beku di tempat kode yang diuji bisa memblokir.** `BenchmarkWaitImmediate`
+lulus pada `-benchtime 50ms` (b.N ≈ burst, jadi ia tidak pernah harus menunggu)
+dan menggantung seluruh run `-bench .` pada `100ms`. Clock yang beku hanya aman
+untuk jalur penolakan yang tidak pernah memblokir.
 
 ---
 
-## 9. Testing strategy
+## 8. Apa yang akan berubah untuk backend terdistribusi sungguhan
 
-Roughly half the repository is tests, and the strategy is deliberate:
+Interface-interface ini dibentuk dengan bertanya apa yang akan dibutuhkan backend
+SQS/Redis/Postgres. Secara konkret:
 
-- **Time is injected.** Every package that depends on wall-clock time accepts a
-  clock, so backoff, refill, and visibility expiry are asserted exactly rather
-  than slept through.
-- **Real timers only for blocking waits**, with generous margins. `Wait` and the
-  drain genuinely block, so those tests use deadlines large enough that
-  scheduling jitter cannot make them flaky.
-- **Every package has a goroutine-leak test.** `make leak` runs them. After the
-  object under test is closed, the goroutine count must return to baseline — the
-  only way to catch a scheduler or worker that was started and never joined.
-- **Idempotence is asserted, not assumed.** `Close`/`Shutdown` are called
-  repeatedly and after error paths, because "it is idempotent" decays the moment
-  someone adds a field.
-- **No test framework.** The assertion vocabulary is `t.Fatalf` with a message
-  naming the expectation and the observed value. A helper that hides that is a
-  liability.
-- **Tests that encode a bug get a comment saying so.** The regression tests for
-  the priority sentinel, the backoff cap, and the shutdown nack each explain what
-  used to be wrong, so a future reader cannot "simplify" the fix away.
+- **`queue.Backend`** di balik permukaan yang ada sekarang. Redis dipetakan ke
+  sorted set untuk job tertunda plus lock per job untuk reservation; Postgres
+  dipetakan ke `FOR UPDATE SKIP LOCKED` plus `LISTEN/NOTIFY` untuk wakeup.
+  Keduanya mengubah scheduler dari "memiliki jam" menjadi "bertanya ke store apa
+  yang sudah jatuh tempo", itulah sebabnya scheduler-nya diisolasi.
+- **Fencing token.** `Delivery.token` adalah `uint64` in-process. Antar proses ia
+  harus menjadi fencing token monotonik agar worker yang bangkit kembali tidak
+  bisa `Ack` sebuah job yang kini dimiliki worker lain. Inilah perubahan yang
+  paling memengaruhi API publik: `Ack` harus gagal dengan berisik pada token yang
+  basi alih-alih mengembalikan `ErrUnknownJob`.
+- **Idempotency key.** Pengiriman at-least-once adalah kontrak yang harus
+  dihormati oleh *consumer*-nya. Queue bisa membantu dengan memunculkan dedup key,
+  tetapi ia tidak bisa menyediakan exactly-once sendirian.
+- **Attempt berbatas untuk reservation yang kedaluwarsa.** Aturan "reservation
+  kedaluwarsa itu gratis" di §2.2 memerlukan counter pendamping, atau job yang
+  patologis menjadi abadi.
+- **Fair scheduling.** Satu priority heap global membuat pekerjaan berprioritas
+  rendah kelaparan di bawah beban yang terus-menerus. Queue per-tenant dengan
+  weighted round-robin adalah perbaikan standarnya.
 
-Benchmarks are measured, never estimated, and live beside the code they exercise
-so they cannot silently rot. Every number in the README comes from a recorded run.
+---
+
+## 9. Strategi testing
+
+Kira-kira setengah repo ini adalah test, dan strateginya disengaja:
+
+- **Waktu di-inject.** Setiap package yang bergantung pada waktu wall clock
+  menerima sebuah clock, sehingga backoff, pengisian ulang, dan kedaluwarsa
+  visibility ditegaskan secara tepat alih-alih ditunggu dengan tidur.
+- **Timer sungguhan hanya untuk penantian yang memblokir**, dengan margin yang
+  lega. `Wait` dan drain memang benar-benar memblokir, jadi test-test itu memakai
+  deadline yang cukup besar agar jitter scheduling tidak membuatnya flaky.
+- **Setiap package punya test kebocoran goroutine.** `make leak` menjalankannya.
+  Setelah objek yang diuji ditutup, jumlah goroutine harus kembali ke baseline —
+  satu-satunya cara menangkap scheduler atau worker yang dijalankan lalu tidak
+  pernah di-join.
+- **Idempotensi ditegaskan, bukan diasumsikan.** `Close`/`Shutdown` dipanggil
+  berulang kali dan setelah jalur error, karena "ia idempotent" luruh begitu
+  seseorang menambahkan sebuah field.
+- **Tanpa test framework.** Kosakata assertion-nya adalah `t.Fatalf` dengan pesan
+  yang menyebutkan ekspektasi dan nilai yang teramati. Helper yang menyembunyikan
+  itu adalah beban.
+- **Test yang mengkodekan sebuah bug diberi komentar yang menyatakannya.** Test
+  regresi untuk sentinel prioritas, cap backoff, dan nack saat shutdown
+  masing-masing menjelaskan apa yang dulunya salah, sehingga pembaca di masa depan
+  tidak bisa "menyederhanakan" perbaikannya hingga hilang.
+
+Benchmark diukur, tidak pernah diperkirakan, dan berada di samping kode yang
+diujinya sehingga tidak bisa membusuk secara senyap. Setiap angka di README berasal
+dari run yang tercatat.
