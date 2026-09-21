@@ -398,7 +398,7 @@ The README is the tour; [`docs/DESIGN.md`](docs/DESIGN.md) is the deep end —
 invariants, the failure taxonomy, the bugs the tests caught, and what a durable
 backend would have to change.
 
-Total: ~6,500 lines including tests.
+Total: ~6,700 lines including tests, across 27 files.
 
 ### `dispatchd` flags
 
