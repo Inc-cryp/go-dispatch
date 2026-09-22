@@ -215,14 +215,32 @@ pemanggil tanpa key gagal secara **fail-open** — ia diam-diam tidak akan perna
 melakukan throttling apa pun. Membuat signature-nya tidak kompatibel mengubah bug
 produksi yang senyap menjadi compile error.
 
-### `Wait` memeriksa context sebelum menghabiskan token
+Alasan yang sama mengatur `NewKeyed`: argumen `Option`-nya dihapus karena hanya
+dibuang tanpa dipakai. Clock tetap dipasok di dalam factory, dan memakainya
+sebagai `Option` kini menjadi error compile, bukan no-op yang senyap.
 
-`TokenBucket.Wait` pada context yang sudah dibatalkan mengembalikan `ctx.Err()`
-tanpa menghabiskan kapasitas. Ini bug fail-open yang ditemukan saat proses
-verifikasi: loop-nya hanya memeriksa `ctx.Err()` di jalur sleep, sehingga iterasi
-pertama akan menghabiskan satu token lalu melaporkan sukses pada context yang
-sudah mati. Kedua implementasi `Wait` sekarang memeriksa di awal setiap iterasi
-dan sekali lagi setelah memberikan token.
+### Penantian tidak pernah menghabiskan kapasitas yang tidak jadi dipakai
+
+`Wait` pada context yang sudah dibatalkan mengembalikan `ctx.Err()` **tanpa
+menghabiskan token**. Ini bug fail-open yang ditemukan saat proses verifikasi:
+loop-nya hanya memeriksa `ctx.Err()` di jalur sleep, sehingga iterasi pertama
+akan menghabiskan satu token lalu melaporkan sukses pada context yang sudah mati.
+Kedua implementasi `Wait` sekarang memeriksa di awal setiap iterasi dan sekali
+lagi setelah memberikan token.
+
+`Multi` sempat punya lubang yang sama dari arah lain: ia menunggu anak-anaknya
+satu per satu, jadi anak pertama sudah membayar sebelum anak kedua sempat
+menolak. Ketika anak kedua yang menahan, `Wait` melaporkan gagal sementara token
+anak pertama sudah melayang. Sekarang `Multi.Wait` memakai loop yang sama:
+me-reserve dulu, menghabiskan hanya setelah **semua** anak setuju.
+
+### `Reserve` tidak pernah melaporkan nol saat `Allow` menolak
+
+Kontraknya adalah "nol berarti sekarang". Konversi token yang kurang menjadi
+durasi dulu memotong ke arah nol, sehingga pada rate tinggi penantian yang nyata
+membulat jadi `0s` padahal `Allow` tetap menolak — dan pemanggil yang percaya
+kontraknya berakhir busy-spin. Sekarang `Reserve` memberi lantai satu nanodetik
+selama bucket masih kurang dari satu token.
 
 ### Worker pool memisahkan context-nya menjadi dua
 

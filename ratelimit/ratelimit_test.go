@@ -504,3 +504,191 @@ func TestTokenBucketConcurrentAllowIsRaceFree(t *testing.T) {
 		t.Fatalf("allowed = %d, want exactly the burst of 100", got)
 	}
 }
+
+// countingLimiter is a child that always allows, but reports a long reserve so
+// that a reserve-first Wait sleeps instead of proceeding. It records every
+// consumption and signals on consulted the first time it is asked anything, so a
+// test can observe what a composite does to its children without sleeping.
+type countingLimiter struct {
+	allows    atomic.Int64
+	spends    atomic.Int64
+	consulted chan struct{}
+}
+
+func newCountingLimiter() *countingLimiter {
+	return &countingLimiter{consulted: make(chan struct{}, 1)}
+}
+
+func (c *countingLimiter) note() {
+	select {
+	case c.consulted <- struct{}{}:
+	default:
+	}
+}
+
+func (c *countingLimiter) Allow() bool {
+	c.allows.Add(1)
+	c.spends.Add(1)
+	c.note()
+	return true
+}
+
+func (c *countingLimiter) Reserve() time.Duration {
+	c.note()
+	return time.Hour
+}
+
+func (c *countingLimiter) Wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.Allow()
+	return ctx.Err()
+}
+
+// blockingLimiter is the slow member of a composite: it reports a long reserve
+// and blocks until its context is done.
+type blockingLimiter struct{}
+
+func (blockingLimiter) Allow() bool            { return false }
+func (blockingLimiter) Reserve() time.Duration { return time.Hour }
+func (blockingLimiter) Wait(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestMultiWaitDoesNotSpendTokenWhenALaterLimiterRefuses is the regression test
+// for a composite that consumed capacity it never delivered.
+//
+// Multi.Wait walks its children in order, so the first child takes a token
+// before the second one has had any chance to refuse. When the second child is
+// what blocks, Wait reports a failure while the first child's token is already
+// gone: the caller is told the event did not happen and is charged for it
+// anyway. That is the same fail-open shape the package already documents for a
+// cancelled context — the token is spent even though the call failed.
+func TestMultiWaitDoesNotSpendTokenWhenALaterLimiterRefuses(t *testing.T) {
+	clk := newFakeClock()
+
+	fast := NewTokenBucket(1, 1, WithClock(clk.Now))
+	slow := NewTokenBucket(1, 1, WithClock(clk.Now))
+
+	// Drain slow so it is the child that refuses. fast keeps its token.
+	if !slow.Allow() {
+		t.Fatal("slow should start with a token")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	if err := Multi(fast, slow).Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait() = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The clock is frozen, so fast cannot have refilled: if its token is gone,
+	// Wait spent it on a call it reported as failed.
+	if !fast.Allow() {
+		t.Fatal("fast.Allow() = false: Wait spent a token from fast but reported an error")
+	}
+}
+
+// TestMultiWaitCancellationDoesNotSpendToken covers the same leak down the
+// cancellation path.
+//
+// The context is cancelled the instant Wait consults the composite, before it
+// has had any reason to believe the call can succeed. An implementation that
+// waits on each child in turn has already taken the first child's token by then;
+// one that reserves first has not touched a token at all.
+func TestMultiWaitCancellationDoesNotSpendToken(t *testing.T) {
+	rec := newCountingLimiter()
+	m := Multi(rec, blockingLimiter{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Wait(ctx) }()
+
+	select {
+	case <-rec.consulted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait never consulted the composite")
+	}
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() = %v, want context.Canceled", err)
+	}
+	if got := rec.spends.Load(); got != 0 {
+		t.Fatalf("Wait spent capacity from a child %d time(s) on a cancelled context", got)
+	}
+}
+
+// TestMultiWaitOnSuccessSpendsExactlyOneTokenPerLimiter pins the other
+// direction, so the fix cannot be "never consume".
+func TestMultiWaitOnSuccessSpendsExactlyOneTokenPerLimiter(t *testing.T) {
+	clk := newFakeClock()
+
+	a := NewTokenBucket(1, 2, WithClock(clk.Now))
+	b := NewTokenBucket(1, 2, WithClock(clk.Now))
+
+	if err := Multi(a, b).Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() = %v, want nil", err)
+	}
+
+	if got := a.Tokens(); got != 1 {
+		t.Fatalf("a.Tokens() = %v, want 1 after one successful Wait", got)
+	}
+	if got := b.Tokens(); got != 1 {
+		t.Fatalf("b.Tokens() = %v, want 1 after one successful Wait", got)
+	}
+}
+
+// TestTokenBucketReserveNeverTruncatesToZeroWhileDenying is the regression test
+// for a reserve that lied about how long the caller had to wait.
+//
+// Reserve converts the missing tokens into a duration, and that conversion used
+// to truncate toward zero. At a high enough rate the wait rounds down to 0s, but
+// Allow still refuses — so a caller that trusts "zero means now" is told there is
+// nothing to wait for while every single Allow keeps failing. waitLoop does
+// exactly that, which turns the truncation into a busy-spin. The rate is a
+// caller-supplied float64 (dispatchd's -rate flag takes any value), so this is
+// reachable without a contrived limiter.
+func TestTokenBucketReserveNeverTruncatesToZeroWhileDenying(t *testing.T) {
+	for _, rate := range []float64{1e9, 1e10, 1e12, 1e15} {
+		t.Run(fmt.Sprintf("rate=%g", rate), func(t *testing.T) {
+			clk := newFakeClock()
+			tb := NewTokenBucket(rate, 1, WithClock(clk.Now))
+
+			if !tb.Allow() {
+				t.Fatal("the initial token should be available")
+			}
+
+			// The clock is frozen, so the bucket cannot refill and the next
+			// Allow must deny. Reserve has to agree that the caller waits.
+			if tb.Allow() {
+				t.Fatal("Allow() = true with a frozen clock and an empty bucket")
+			}
+			if got := tb.Reserve(); got <= 0 {
+				t.Fatalf("Reserve() = %v while Allow() denies, want a positive duration", got)
+			}
+		})
+	}
+}
+
+// TestTokenBucketReserveIsPositiveAtTheClampedMinimum pins the other end: the
+// clamp that makes Reserve positive must not overflow the duration at minRate.
+func TestTokenBucketReserveIsPositiveAtTheClampedMinimum(t *testing.T) {
+	clk := newFakeClock()
+	tb := NewTokenBucket(0, 1, WithClock(clk.Now)) // 0 is clamped to minRate
+
+	if !tb.Allow() {
+		t.Fatal("the initial token should be available")
+	}
+
+	got := tb.Reserve()
+	if got <= 0 {
+		t.Fatalf("Reserve() = %v, want a positive duration at the clamped minimum rate", got)
+	}
+	// A positive result must stay a sane time.Duration rather than wrap negative.
+	if got > 200*365*24*time.Hour {
+		t.Fatalf("Reserve() = %v, want a value inside a time.Duration", got)
+	}
+}
