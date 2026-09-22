@@ -250,6 +250,22 @@ Memperbaikinya memunculkan bug kedua — `d := l.Reserve()` yang menaungi
 reservation luarnya, membuat loop me-reserve ulang di setiap putaran. Keduanya
 dikunci oleh test, karena keduanya hanya muncul saat contention.
 
+Jaminan yang sama berlaku untuk `Multi`. Semula `Multi.Wait` menunggu anak-anaknya
+**satu per satu** (`for _, l := range m.limiters { l.Wait(ctx) }`), sehingga anak
+pertama sudah menghabiskan tokennya sebelum anak kedua sempat menolak. Ketika anak
+kedua yang menahan — entah karena penuh atau karena context-nya mati di tengah
+penantian — `Wait` melaporkan gagal sementara token anak pertama sudah melayang.
+Itu bentuk fail-open yang persis sama dengan bug di atas: pemanggil diberi tahu
+bahwa kejadiannya tidak terjadi, tetapi tetap ditagih kapasitasnya. Sekarang
+`Multi.Wait` mendelegasikan ke `waitLoop`, yang me-reserve dulu dan baru
+menghabiskan setelah **setiap** anak melaporkan kapasitas, sekaligus memeriksa
+context sebelum menghabiskan apa pun.
+
+Penantian itu tidak atomik: anak bisa tetap menolak di pass `Allow` bila pemanggil
+lain berlomba di sela-selanya, persis seperti yang sudah didokumentasikan
+`Multi.Allow`. Yang dihilangkan hanyalah menghabiskan token pada panggilan yang
+kemudian melaporkan error.
+
 ### 4.3 `Keyed` bukan `Limiter`, dengan sengaja
 
 `TokenBucket`, `FixedWindow`, dan `Multi` mengimplementasikan `Limiter` — tanpa
@@ -270,6 +286,14 @@ merotasi key *dan* memicu eviction mendapat bypass parsial. Sistem produksi akan
 melakukan evict berdasarkan LRU dengan masa tinggal minimum. Didokumentasikan,
 bukan disembunyikan.
 
+Filosofi yang sama mengatur signature `NewKeyed`. Argumen `Option` sempat ada di
+sana tetapi tidak pernah dipakai — `NewKeyed(factory, maxKeys, _ ...Option)`
+membuangnya begitu saja. Sebuah parameter yang diam-diam tidak melakukan apa pun
+lebih buruk daripada tidak ada parameter: pemanggil mengira sudah mengatur clock
+lewat `WithClock`, padahal tidak. Karena itu parameternya dihapus; clock
+dipasok di dalam `factory`, dan kesalahan memakainya sebagai `Option` menjadi
+error compile alih-alih no-op yang senyap.
+
 ### 4.4 Argumen tidak valid di-clamp
 
 Rate negatif, burst nol, window yang tidak positif — masing-masing di-clamp ke
@@ -277,6 +301,22 @@ minimum yang wajar alih-alih panic. Konfigurasi yang datang dari flag atau
 environment seharusnya tidak bisa membuat prosesnya crash pada waktu konstruksi.
 `Multi` memperkuat ini: `Reserve` mengembalikan penantian **maksimum** dari
 anak-anaknya, karena setiap anak harus terpenuhi.
+
+### 4.5 `Reserve` tidak pernah melaporkan nol saat `Allow` menolak
+
+Kontrak `Reserve` adalah "nol berarti sekarang". Konversi token yang kurang
+menjadi durasi dulu memotong ke arah nol (`time.Duration(missing / rate *
+float64(time.Second))`), sehingga pada rate yang cukup tinggi penantian yang
+nyata membulat menjadi `0s` sementara `Allow` tetap menolak. `waitLoop`
+mempercayai "nol berarti sekarang" dan langsung mencoba `Allow` — jadi
+truncation itu berubah menjadi busy-spin.
+
+Rate adalah `float64` dari pemanggil (flag `-rate` di `dispatchd` menerima nilai
+apa pun), jadi ini bisa dicapai tanpa limiter yang aneh-aneh. `Reserve` sekarang
+memberi lantai satu nanodetik selama bucket masih kurang dari satu token. Di
+`minRate` nilainya 1e18 ns, masih jauh di dalam rentang `int64` milik
+`time.Duration` (maksimum sekitar 292 tahun), jadi lantai itu tidak bisa
+membalik tanda.
 
 ---
 
@@ -395,6 +435,8 @@ menunggu sampai sebuah test atau probe menjalankan jalurnya.
 | Panic send-on-closed-channel di queue | Producer yang mengirim saat `Subscription.Close` berlomba menutup channel-nya: `panic: send on closed channel` | `sendMu`/`closed` pada `Subscription`, sehingga cek-lalu-kirim atomik terhadap close |
 | Filter topik subscription mati | `Subscribe(TopicDone)` juga menerima `TopicEnqueued`; set topiknya tersimpan tapi tak pernah dibaca | `deliver` membuang event di luar set topik sebelum menyentuh buffer |
 | `Extend` menimpa deadline | Dua `Extend` berurutan menyisakan ruang sebesar yang terakhir saja, membuang yang sebelumnya | `it.deadl = it.deadl.Add(ext)` |
+| `Multi.Wait` membocorkan token | Penantian sekuensial: anak pertama menghabiskan token sebelum anak berikutnya menolak, lalu `Wait` melaporkan gagal | `Multi.Wait` mendelegasikan ke `waitLoop`, yang me-reserve dulu dan baru menghabiskan saat semua anak setuju |
+| `Reserve` melaporkan nol saat menolak | Konversi durasi memotong ke arah nol pada rate tinggi, padahal `Allow` tetap menolak; `waitLoop` langsung percaya "nol berarti sekarang" dan busy-spin | Lantai satu nanodetik selama bucket masih kurang dari satu token |
 
 Salah satu bug benchmark di atas layak digeneralisasi: **sebuah benchmark tidak
 boleh memakai clock yang beku di tempat kode yang diuji bisa memblokir.**

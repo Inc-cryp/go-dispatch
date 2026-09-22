@@ -132,6 +132,13 @@ func (t *TokenBucket) Allow() bool {
 }
 
 // Reserve reports how long until one token is available. It does not consume.
+//
+// The wait is never reported as zero while the bucket is short of a token. The
+// float-to-duration conversion truncates toward zero, so at a high rate it would
+// otherwise round a real wait down to 0s; a caller that reads "zero means now"
+// (waitLoop does) would then retry Allow in a tight loop. The floor of one
+// nanosecond keeps the contract honest at any rate. At minRate the value is
+// 1e18 ns, well inside time.Duration's int64 range.
 func (t *TokenBucket) Reserve() time.Duration {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -140,7 +147,11 @@ func (t *TokenBucket) Reserve() time.Duration {
 		return 0
 	}
 	missing := 1 - t.tokens
-	return time.Duration(missing / t.rate * float64(time.Second))
+	ns := missing / t.rate * float64(time.Second)
+	if ns < 1 {
+		return time.Nanosecond
+	}
+	return time.Duration(ns)
 }
 
 // Tokens reports the current token level, after accounting for elapsed time.
@@ -330,13 +341,19 @@ func (m *multiLimiter) Reserve() time.Duration {
 }
 
 // Wait blocks until every limiter has capacity.
+//
+// It goes through waitLoop rather than waiting on each child in turn. Waiting
+// sequentially would take a token from an early child before a later one has had
+// any chance to refuse, so a composite that ends up failing would still have
+// spent capacity it never delivered — and the same would happen when the context
+// is cancelled mid-wait. waitLoop reserves first and only consumes once every
+// child reports capacity, and it checks the context before consuming anything.
+//
+// The wait is not atomic: a child can still deny in the Allow pass if another
+// caller races it in between, exactly as Multi.Allow documents. What is ruled out
+// is spending a token on a call that then reports an error.
 func (m *multiLimiter) Wait(ctx context.Context) error {
-	for _, l := range m.limiters {
-		if err := l.Wait(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+	return waitLoop(ctx, m)
 }
 
 // Keyed hands out one Limiter per key and bounds how many it remembers.
@@ -365,7 +382,13 @@ type keyedEntry struct {
 // NewKeyed creates a keyed limiter. newLimiter is called to create a limiter for
 // a key that is not yet tracked, so the caller controls the policy. maxKeys is
 // clamped to at least 1.
-func NewKeyed(newLimiter func() Limiter, maxKeys int, _ ...Option) *Keyed {
+//
+// A factory per key is what a keyed limiter needs, so the clock is supplied by
+// the caller inside newLimiter rather than through an Option: functional options
+// would be swallowed here, and a parameter that silently does nothing is worse
+// than no parameter at all. Omitting it makes the mistake a compile error,
+// matching the reasoning behind Keyed not implementing Limiter.
+func NewKeyed(newLimiter func() Limiter, maxKeys int) *Keyed {
 	if newLimiter == nil {
 		newLimiter = func() Limiter { return NewTokenBucket(1, 1) }
 	}
