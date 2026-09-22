@@ -164,8 +164,16 @@ Mencampur keduanya menghasilkan salah satu dari dua bug tergantung ke arah mana
 pembatalannya merambat: entah shutdown kembali selagi handler masih mengubah
 state (pekerjaan hilang), atau shutdown terblokir sampai setiap handler selesai
 tak peduli berapa lama (drain tak berbatas). Memisahkannya membuat pool bisa
-berhenti *menarik* pekerjaan sementara pekerjaan yang melayang tetap berjalan di
-bawah signal context milik operator — di `cmd/dispatchd`, context `SIGTERM`.
+berhenti *menarik* pekerjaan sementara pekerjaan yang melayang tetap berjalan
+sampai selesai.
+
+Pemisahan itu hanya berguna kalau pemanggilnya ikut menjaganya. `Start(ctx)`
+memakai `ctx` apa adanya sebagai context handler, jadi menyerahkan context
+`SIGTERM` ke `Start` justru membuat `Shutdown` membatalkan handler yang sedang
+ia tunggu — persis bug yang pemisahan ini dimaksudkan untuk mencegah. Karena itu
+`cmd/dispatchd` tidak menyerahkan context signal ke pool: `serve` menurunkan
+context handler dari context signal lewat `context.WithoutCancel`, sehingga
+handler tetap hidup saat drain sementara nilainya tetap terbawa.
 
 `Shutdown` bersifat idempotent dan dibatasi oleh `WithDrainTimeout`. Saat
 kedaluwarsa ia mengembalikan error yang membungkus `context.DeadlineExceeded`, dan
@@ -381,12 +389,14 @@ satunya ditemukan oleh test, bukan dengan membaca.
 | Tabrakan ID benchmark | `time.Now().UnixNano()` menghasilkan ID hidup yang duplikat | Counter `atomic.Uint64` |
 | Benchmark hang | Mengisi awal `1<<16` tetap sementara `RunParallel` menotal `b.N` | Isi awal tepat `b.N` |
 | Benchmark hang (2) | Clock yang beku membuat `Wait` memblokir begitu burst-nya habis | `benchClock.step` memajukan waktu di setiap pembacaan |
+| Shutdown tidak men-drain | `SIGTERM` membatalkan handler yang sedang melayang; job kembali sebagai `handler interrupted by shutdown` | `serve` menurunkan context handler dari context signal lewat `context.WithoutCancel` |
+| Handler dipanggil dengan delivery kosong | `Dequeue` yang gagal jatuh ke jalur sukses dan menjalankan handler atas `Delivery` bernilai nol | Tiap cabang error terminal (`return`), error transien `continue` |
 
-Yang terakhir layak digeneralisasi: **sebuah benchmark tidak boleh memakai clock
-yang beku di tempat kode yang diuji bisa memblokir.** `BenchmarkWaitImmediate`
-lulus pada `-benchtime 50ms` (b.N ≈ burst, jadi ia tidak pernah harus menunggu)
-dan menggantung seluruh run `-bench .` pada `100ms`. Clock yang beku hanya aman
-untuk jalur penolakan yang tidak pernah memblokir.
+Salah satu bug benchmark di atas layak digeneralisasi: **sebuah benchmark tidak
+boleh memakai clock yang beku di tempat kode yang diuji bisa memblokir.**
+`BenchmarkWaitImmediate` lulus pada `-benchtime 50ms` (b.N ≈ burst, jadi ia tidak
+pernah harus menunggu) dan menggantung seluruh run `-bench .` pada `100ms`. Clock
+yang beku hanya aman untuk jalur penolakan yang tidak pernah memblokir.
 
 ---
 

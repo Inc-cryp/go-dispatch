@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -402,5 +404,105 @@ func TestProbeHealthReportsStatus(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("probeHealth took %s to fail on a closed listener, want a fast failure", elapsed)
+	}
+}
+
+// TestServeDrainsInFlightHandlersOnSignal guards the wiring that decides
+// whether a SIGTERM drains the pool or guts it, by driving the real service
+// loop — serve, the same function run calls — rather than a reconstruction of
+// it.
+//
+// worker.Pool takes a single context and splits it in two: a dispatch context
+// derived from it, which Shutdown cancels, and the context itself, which the
+// handlers run under. A serve that started the pool with the signal context
+// would therefore have Shutdown cancel the very handlers it is about to wait
+// for: the pool drains nothing and every in-flight job comes back as "handler
+// interrupted by shutdown". The job here is deliberately cancelled-aware, like
+// the real handlers, so the bug shows up as a retry rather than a timeout.
+func TestServeDrainsInFlightHandlersOnSignal(t *testing.T) {
+	q := queue.New(queue.WithVisibility(10 * time.Second))
+	defer q.Close()
+
+	started := make(chan struct{})
+	var startOnce sync.Once
+	var completed atomic.Int64
+	var gotErr atomic.Value
+
+	// Every job sleeps, so whichever one is in flight when the signal lands is
+	// the one the drain has to protect.
+	pool := worker.New(q,
+		worker.WithWorkers(1),
+		worker.WithHandler(func(ctx context.Context, _ queue.Delivery) error {
+			startOnce.Do(func() { close(started) })
+			// Mirrors the handlers in run, all of which honour cancellation. If
+			// the signal context reaches them, this returns at once and the job
+			// is retried instead of finished.
+			if err := sleepCtx(ctx, 250*time.Millisecond); err != nil {
+				gotErr.Store(err)
+				return err
+			}
+			completed.Add(1)
+			return nil
+		}),
+		worker.WithDrainTimeout(5*time.Second),
+	)
+
+	// The listener is real but bound to an ephemeral loopback port: serve only
+	// needs ListenAndServe to succeed and Shutdown to return, and leaving Addr
+	// empty would have it try the privileged port 80 instead.
+	srv := &http.Server{Addr: "127.0.0.1:0", ReadHeaderTimeout: time.Second}
+
+	// signalCtx stands in for the root context in run, and stopSignal for the
+	// operator hitting Ctrl-C.
+	ctx, stopSignal := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignal()
+
+	// serve generates no work of its own here, so the only job in the pool is
+	// the one whose drain this test is about. Letting produce add a second job
+	// would leave it queued behind the single worker, and that job — not the
+	// one under test — is what the post-shutdown assertions would then see.
+	// Enqueuing before serve starts keeps the ordering deterministic.
+	if err := q.Enqueue(queue.Entry{
+		ID:          "in-flight",
+		Payload:     kindEmailSend,
+		MaxAttempts: 3,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() {
+		served <- serve(ctx, config{
+			addr:        "127.0.0.1:0",
+			subjects:    0,
+			shutdownFor: 5 * time.Second,
+		}, q, pool, srv, discardLogger())
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	// The operator hits Ctrl-C while the job is mid-flight.
+	stopSignal()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve never returned after the shutdown signal")
+	}
+	if completed.Load() == 0 {
+		t.Fatal("the in-flight job did not finish: the shutdown cut it off instead of draining it")
+	}
+	if ps := pool.Stats(); ps.Failed != 0 || ps.Dead != 0 {
+		t.Fatalf("pool stats = %+v, want Failed=0 Dead=0: a drained job must not be retried", ps)
+	}
+	if qs := q.Stats(); qs.Failed != 0 {
+		t.Fatalf("queue stats = %+v, want Failed=0", qs)
 	}
 }

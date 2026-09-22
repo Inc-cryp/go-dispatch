@@ -112,7 +112,7 @@ func run() error {
 
 	// The root context is cancelled on SIGINT/SIGTERM, which is what turns the
 	// whole shutdown story into a single mechanism: cancelling this context
-	// aborts in-flight handlers, unblocks the dispatcher, and unwinds the pool.
+	// unblocks the dispatcher and ends the service loop in serve.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -184,6 +184,47 @@ func run() error {
 	// 5. HTTP: health and stats, served off a separate listener so the demo can
 	//    be probed while it drains.
 	srv := newServer(cfg.addr, q, pool, logger)
+
+	if err := serve(ctx, cfg, q, pool, srv, logger); err != nil {
+		return err
+	}
+
+	reportFinal(q, pool, limiter)
+
+	if err := bus.Close(); err != nil {
+		return fmt.Errorf("closing event bus: %w", err)
+	}
+	return nil
+}
+
+// serve runs the service loop: it starts the pool, submits the workload, blocks
+// until the operator signals or the listener dies, and then shuts everything
+// down in order. It is separated from run so the shutdown wiring — the part that
+// decides whether a SIGTERM drains the pool or guts it — can be tested without
+// binding a port or sending a real signal.
+//
+// ctx is the dispatch context: cancelling it is what signals a shutdown.
+// handlerCtx is deliberately a different context and is what the pool is
+// started with. The pool derives its own cancellable dispatch context from
+// whatever it is given and cancels only that derived context on Shutdown, so
+// handing it ctx here would make Shutdown cancel the very handlers it is about
+// to wait for: the pool would drain nothing and every in-flight job would come
+// back as "handler interrupted by shutdown".
+func serve(
+	ctx context.Context,
+	cfg config,
+	q *queue.Queue,
+	pool *worker.Pool,
+	srv *http.Server,
+	logger *slog.Logger,
+) error {
+	// handlerCtx is deliberately derived from ctx with WithoutCancel: it has to
+	// outlive the signal that ends the service loop, but it is still tied to the
+	// same request-scoped values. abortHandlers is the override for a handler
+	// that refuses to finish on its own; drainCtx below bounds it in practice.
+	handlerCtx, abortHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	defer abortHandlers()
+
 	srvErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -194,7 +235,7 @@ func run() error {
 	}()
 	logger.Info("http listening", "addr", cfg.addr)
 
-	if err := pool.Start(ctx); err != nil {
+	if err := pool.Start(handlerCtx); err != nil {
 		return fmt.Errorf("starting worker pool: %w", err)
 	}
 
@@ -211,25 +252,29 @@ func run() error {
 		}
 	}
 
-	// Shutdown order matters: stop the producers and the listener first, then
-	// drain the pool so no job is cut off mid-flight, then close the bus last so
-	// the final state transitions still get published.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownFor)
-	defer cancel()
+	// Shutdown order matters: drainCtx bounds the whole sequence, so the
+	// process cannot outlive -shutdown-timeout even if a handler ignores
+	drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), cfg.shutdownFor)
+	defer cancelDrain()
 
-	_ = srv.Shutdown(shutdownCtx)
+	// Each stage gets its own sub-deadline, so a hung listener or overrunning
+	// handlers cannot starve the stage after it.
+	srvCtx, cancelSrv := context.WithTimeout(drainCtx, cfg.shutdownFor/2)
+	defer cancelSrv()
+	_ = srv.Shutdown(srvCtx)
 
-	if err := pool.Shutdown(shutdownCtx); err != nil {
-		// A drain timeout is expected when a job misbehaves; report it but do
-		// not fail the process, the counters below tell the real story.
+	// pool.Shutdown stops the dispatcher and then waits for the workers to
+	// finish the deliveries already in the channel. Those handlers run under
+	// handlerCtx, which is still live here: that is what makes this a drain
+	// rather than a race. Only if it overruns do we abort the handlers.
+	if err := pool.Shutdown(drainCtx); err != nil {
+		// A drain timeout is expected when a handler misbehaves. Tear the
+		// remaining handlers down and report it, but do not fail the process:
+		// the counters below tell the real story.
+		abortHandlers()
 		logger.Warn("pool drain did not complete cleanly", "err", err)
 	}
 
-	reportFinal(q, pool, limiter)
-
-	if err := bus.Close(); err != nil {
-		return fmt.Errorf("closing event bus: %w", err)
-	}
 	return nil
 }
 
