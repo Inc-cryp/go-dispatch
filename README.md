@@ -115,8 +115,22 @@ goroutine dengan `time.Timer` yang di-reset ke deadline berikutnya itu
 prediktabel, murah, dan mudah di-drain.
 
 `Queue.Close()` bersifat idempotent dan aman konkuren; ia menghentikan scheduler,
-menguras fan-out event-nya, lalu menandai queue tertutup. Enqueue setelah itu
+menutup setiap subscription, lalu menandai queue tertutup. Enqueue setelah itu
 mengembalikan `ErrClosed`, bukan panic.
+
+### Fan-out event queue: topic disaring, subscriber lambat dibuang
+
+`Subscribe(topics...)` menyaring per topic, dan `Subscribe()` tanpa argumen berarti
+semuanya. Setiap transisi memancarkan tepat satu event: `enqueued`, `dequeued`,
+`done`, `failed`, `retried`, dan `requeued`, masing-masing membawa `JobID`, `State`,
+`Attempt`, dan `At` — cukup bagi operator untuk merekonstruksi riwayat sebuah job
+tanpa menyentuh queue-nya.
+
+Pengirimannya **non-blocking**: subscriber yang buffernya penuh kehilangan event
+dan menghitungnya di `Subscription.Dropped()`, alih-alih menahan queue. Liveness
+queue mengalahkan kelengkapan notifikasi, dan notifikasi yang hilang bisa dipulihkan
+dari `Stats()`. `Close` pada subscription idempotent dan aman dipanggil bersamaan
+dengan producer yang sedang mengirim.
 
 ### Visibility timeout, bukan lock yang dipegang sepanjang handler
 

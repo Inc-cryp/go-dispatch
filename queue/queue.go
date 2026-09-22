@@ -463,13 +463,14 @@ func (q *Queue) tryReserve() (Delivery, bool) {
 	now := q.cfg.now()
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if q.closed || len(q.heap) == 0 {
+		q.mu.Unlock()
 		return Delivery{}, false
 	}
 	// The heap orders by RunAt, so if the head is not yet due, nothing is.
 	it := q.heap[0]
 	if it.entry.RunAt.After(now) {
+		q.mu.Unlock()
 		return Delivery{}, false
 	}
 
@@ -486,6 +487,15 @@ func (q *Queue) tryReserve() (Delivery, bool) {
 		Deadline: it.deadl,
 		token:    it.token,
 	}
+	q.mu.Unlock()
+
+	// Emitted after the unlock because emit takes q.mu. The event is copied out
+	// under the lock above rather than read from the item, which another
+	// goroutine may already be requeuing by now.
+	q.emit(Event{
+		Topic: TopicDequeued, JobID: d.Job.ID, State: StateReserved,
+		Attempt: d.Attempt, At: now,
+	})
 	return d, true
 }
 
@@ -572,7 +582,7 @@ func (q *Queue) Extend(d Delivery, ext time.Duration) error {
 	if !ok || it.entry.ID != d.Job.ID {
 		return fmt.Errorf("%w: %q", ErrUnknownJob, d.Job.ID)
 	}
-	it.deadl = q.cfg.now().Add(ext)
+	it.deadl = it.deadl.Add(ext)
 	return nil
 }
 
@@ -727,22 +737,49 @@ func (q *Queue) emit(e Event) {
 	q.mu.Unlock()
 
 	for _, s := range subs {
-		select {
-		case s.ch <- e:
-		default:
-			s.dropped.Add(1)
-		}
+		s.deliver(e)
 	}
 }
 
 // Subscription receives queue events. Obtain one from Subscribe and release it
 // with Close when done.
 type Subscription struct {
-	q       *Queue
-	topics  map[Topic]bool
+	q      *Queue
+	topics map[Topic]bool
+
+	// ch carries queued events. sendMu is held for reading by every sender and
+	// for writing by Close, which is what makes "check closed, then send"
+	// atomic with respect to closing ch. emit snapshots the subscriber set
+	// under q.mu and releases it before sending, so without this lock a sender
+	// that took its snapshot a moment before Close would send on a closed
+	// channel and panic.
+	sendMu  sync.RWMutex
 	ch      chan Event
+	closed  bool
 	dropped atomic.Uint64
 	once    sync.Once
+}
+
+// deliver hands one event to the subscription's buffer, skipping it when the
+// subscriber did not ask for the topic or cannot keep up.
+func (s *Subscription) deliver(e Event) {
+	// Check the topic before taking the lock: an unsubscribed event is not a
+	// delivery at all, so it must not be counted as a drop.
+	if len(s.topics) > 0 && !s.topics[e.Topic] {
+		return
+	}
+
+	s.sendMu.RLock()
+	defer s.sendMu.RUnlock()
+	if s.closed {
+		return // the subscriber went away deliberately; not an error
+	}
+
+	select {
+	case s.ch <- e:
+	default:
+		s.dropped.Add(1)
+	}
 }
 
 // Subscribe returns a Subscription delivering events for the given topics.
@@ -779,7 +816,8 @@ func (s *Subscription) C() <-chan Event { return s.ch }
 // not keep up.
 func (s *Subscription) Dropped() uint64 { return s.dropped.Load() }
 
-// Close unsubscribes and closes the event channel. It is idempotent.
+// Close unsubscribes and closes the event channel. It is idempotent and safe to
+// call concurrently with producers.
 func (s *Subscription) Close() error {
 	s.q.mu.Lock()
 	delete(s.q.subs, s)
@@ -789,6 +827,14 @@ func (s *Subscription) Close() error {
 	return nil
 }
 
+// close marks the subscription closed and closes its event channel. The write
+// lock is what excludes a concurrent deliver holding the read lock, so the
+// close can never land between a sender's closed check and its send.
 func (s *Subscription) close() {
-	s.once.Do(func() { close(s.ch) })
+	s.once.Do(func() {
+		s.sendMu.Lock()
+		defer s.sendMu.Unlock()
+		s.closed = true
+		close(s.ch)
+	})
 }

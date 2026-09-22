@@ -374,8 +374,9 @@ bisa memperlakukannya seragam dengan deadline lain mana pun.
 
 ## 7. Bug yang ditemukan saat proses verifikasi
 
-Dicatat karena inilah bukti bahwa test-nya membayar dirinya sendiri. Setiap
-satunya ditemukan oleh test, bukan dengan membaca.
+Dicatat karena inilah bukti bahwa test-nya membayar dirinya sendiri. Tidak ada
+yang ditemukan dengan membaca ulang kode saja: setiap baris di bawah ini
+menunggu sampai sebuah test atau probe menjalankan jalurnya.
 
 | Bug | Gejala | Perbaikan |
 | --- | --- | --- |
@@ -391,6 +392,9 @@ satunya ditemukan oleh test, bukan dengan membaca.
 | Benchmark hang (2) | Clock yang beku membuat `Wait` memblokir begitu burst-nya habis | `benchClock.step` memajukan waktu di setiap pembacaan |
 | Shutdown tidak men-drain | `SIGTERM` membatalkan handler yang sedang melayang; job kembali sebagai `handler interrupted by shutdown` | `serve` menurunkan context handler dari context signal lewat `context.WithoutCancel` |
 | Handler dipanggil dengan delivery kosong | `Dequeue` yang gagal jatuh ke jalur sukses dan menjalankan handler atas `Delivery` bernilai nol | Tiap cabang error terminal (`return`), error transien `continue` |
+| Panic send-on-closed-channel di queue | Producer yang mengirim saat `Subscription.Close` berlomba menutup channel-nya: `panic: send on closed channel` | `sendMu`/`closed` pada `Subscription`, sehingga cek-lalu-kirim atomik terhadap close |
+| Filter topik subscription mati | `Subscribe(TopicDone)` juga menerima `TopicEnqueued`; set topiknya tersimpan tapi tak pernah dibaca | `deliver` membuang event di luar set topik sebelum menyentuh buffer |
+| `Extend` menimpa deadline | Dua `Extend` berurutan menyisakan ruang sebesar yang terakhir saja, membuang yang sebelumnya | `it.deadl = it.deadl.Add(ext)` |
 
 Salah satu bug benchmark di atas layak digeneralisasi: **sebuah benchmark tidak
 boleh memakai clock yang beku di tempat kode yang diuji bisa memblokir.**
@@ -451,6 +455,13 @@ Kira-kira setengah repo ini adalah test, dan strateginya disengaja:
   regresi untuk sentinel prioritas, cap backoff, dan nack saat shutdown
   masing-masing menjelaskan apa yang dulunya salah, sehingga pembaca di masa depan
   tidak bisa "menyederhanakan" perbaikannya hingga hilang.
+- **Balapan yang hanya muncul pada interleaving tertentu diuji dengan mengulang,
+  bukan dengan menambah sleep.** Test panic send-on-closed-channel menjalankan
+  ronde-nya berulang kali dengan jumlah subscriber yang banyak, karena yang
+  membuatnya ketahuan adalah lebar jendela antara snapshot dan pengiriman, bukan
+  waktu tunggu. Di bawah `-race` test itu di-skip: detektornya memperlambat
+  penjadwal sampai interleaving-nya berubah, sementara jendelanya tetap selebar
+  semula.
 
 Benchmark diukur, tidak pernah diperkirakan, dan berada di samping kode yang
 diujinya sehingga tidak bisa membusuk secara senyap. Setiap angka di README berasal
