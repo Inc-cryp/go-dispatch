@@ -31,10 +31,13 @@ type fakeSink struct {
 	nacks  []nackCall
 	extend []queue.Delivery
 
-	ackErr    error
-	nackErr   error
-	deqErr    error
-	extendErr error
+	ackErr  error
+	nackErr error
+	deqErr  error
+	// deqErrOnce makes a Dequeue failure transient, so the pool can be observed
+	// both failing and recovering.
+	deqErrOnce bool
+	extendErr  error
 
 	deqDelay time.Duration
 }
@@ -85,6 +88,9 @@ func (f *fakeSink) Dequeue(ctx context.Context) (queue.Delivery, error) {
 		f.mu.Lock()
 		if f.deqErr != nil {
 			err := f.deqErr
+			if f.deqErrOnce {
+				f.deqErr = nil
+			}
 			f.mu.Unlock()
 			return queue.Delivery{}, err
 		}
@@ -934,5 +940,183 @@ func TestShutdownNackIsReportedAsRetryNotFailure(t *testing.T) {
 	}
 	if st := p.Stats(); st.Retried != 1 || st.Dead != 0 {
 		t.Fatalf("Stats = %+v, want Retried=1 Dead=0", st)
+	}
+}
+
+// TestInFlightCountsJobsAlreadyPickedUp pins the drain diagnostic. Without the
+// dispatcher-side counter, InFlight() is len(p.jobs), which a worker's receive
+// drains immediately — so it reads 0 while jobs are still running and the drain
+// timeout reports "0 jobs in flight" precisely when jobs are in flight.
+func TestInFlightCountsJobsAlreadyPickedUp(t *testing.T) {
+	const jobs = 3
+
+	sink := newFakeSink()
+	for i := range jobs {
+		sink.push(queue.Entry{ID: fmt.Sprintf("held-%d", i), MaxAttempts: 1})
+	}
+
+	release := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(jobs)
+
+	p := New(sink, WithWorkers(jobs), WithHandler(func(context.Context, queue.Delivery) error {
+		started.Done()
+		<-release
+		return nil
+	}))
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	started.Wait()
+
+	// Every job has been handed to a worker, so the jobs channel is empty. The
+	// pool is nonetheless entirely busy.
+	if got := p.InFlight(); got != jobs {
+		t.Fatalf("InFlight() = %d, want %d: jobs taken by workers still count", got, jobs)
+	}
+
+	close(release)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if got := p.InFlight(); got != 0 {
+		t.Fatalf("InFlight() = %d after a clean drain, want 0", got)
+	}
+}
+
+// TestDrainTimeoutReportsJobsStillInFlight covers the message the operator sees
+// when a drain overruns: it must name how much work was abandoned.
+func TestDrainTimeoutReportsJobsStillInFlight(t *testing.T) {
+	sink := newFakeSink(queue.Entry{ID: "stuck", MaxAttempts: 1})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p := New(sink,
+		WithWorkers(1),
+		WithDrainTimeout(100*time.Millisecond),
+		WithHandler(func(context.Context, queue.Delivery) error {
+			close(started)
+			<-release
+			return nil
+		}),
+	)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	err := p.Shutdown(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v, want context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "1 jobs in flight") {
+		t.Fatalf("Shutdown error = %q, want it to report 1 job in flight", err)
+	}
+
+	close(release)
+}
+
+// TestShutdownRacingStartDoesNotStrandTheDispatcher covers the last-caller-loses
+// window between Start and Shutdown. A caller is entitled to shut a pool down
+// without having started it; Shutdown used to read p.cancel unlocked, so if it
+// won that race against Start the dispatcher was left parked on an idle Dequeue
+// and Shutdown blocked until its own context expired. Run under -race, which is
+// how CI runs this package, the unsynchronised pair is also a reported race.
+func TestShutdownRacingStartDoesNotStrandTheDispatcher(t *testing.T) {
+	for range 20 {
+		sink := newFakeSink()
+		p := New(sink,
+			WithWorkers(2),
+			WithHandler(func(context.Context, queue.Delivery) error { return nil }),
+		)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = p.Start(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			_ = p.Shutdown(context.Background())
+		}()
+		wg.Wait()
+
+		// Whichever order they landed in, the pool must be fully torn down: the
+		// dispatcher released, the workers gone, nothing reported in flight.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := p.Shutdown(shutdownCtx)
+		cancel()
+		if err != nil {
+			t.Fatalf("second Shutdown = %v, want nil once the pool is down", err)
+		}
+		if got := p.InFlight(); got != 0 {
+			t.Fatalf("InFlight() = %d after shutdown, want 0", got)
+		}
+	}
+}
+
+// TestDequeueErrorDoesNotRunTheHandlerOnAPhantomJob covers the fall-through in
+// the dispatcher. A Dequeue error means no delivery was produced, so the
+// handler must never see one; treating the zero-value Delivery as real would
+// execute the handler for a job with no ID against a queue that never issued
+// it, and then Ack that non-existent reservation as a success.
+func TestDequeueErrorDoesNotRunTheHandlerOnAPhantomJob(t *testing.T) {
+	sink := newFakeSink()
+	sink.deqErr = errors.New("transient backend failure")
+	sink.deqErrOnce = true
+	sink.deqDelay = time.Millisecond
+
+	var mu sync.Mutex
+	var handled []queue.Delivery
+
+	p := New(sink,
+		WithWorkers(2),
+		WithHandler(func(_ context.Context, d queue.Delivery) error {
+			mu.Lock()
+			handled = append(handled, d)
+			mu.Unlock()
+			return nil
+		}),
+	)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Long enough for the dispatcher to hit the error and keep polling.
+	time.Sleep(150 * time.Millisecond)
+
+	// A genuine job still gets through once the backend recovers, which is what
+	// the "keep polling" contract is for.
+	sink.push(queue.Entry{ID: "real", MaxAttempts: 1})
+	waitDrained(t, sink, p, 1)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, d := range handled {
+		if d.Job.ID == "" {
+			t.Fatalf("handler ran on the zero-value delivery: %+v", d)
+		}
+	}
+	if len(handled) != 1 {
+		t.Fatalf("handler ran %d times, want 1 (the one real job)", len(handled))
+	}
+	if st := p.Stats(); st.Processed != 1 || st.Succeeded != 1 {
+		t.Fatalf("Stats = %+v, want Processed=1 Succeeded=1", st)
 	}
 }

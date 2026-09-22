@@ -97,13 +97,21 @@ type Pool struct {
 	cfg  Config
 	sink Sink
 
-	jobs    chan queue.Delivery
-	wg      sync.WaitGroup // one per worker goroutine
-	dispWG  sync.WaitGroup // the dispatcher goroutine
-	stopped atomic.Bool
-	once    sync.Once
-	cancel  context.CancelFunc // unblocks Dequeue and limiter waits on Shutdown
-	started atomic.Bool
+	jobs      chan queue.Delivery
+	wg        sync.WaitGroup // one per worker goroutine
+	dispWG    sync.WaitGroup // the dispatcher goroutine
+	stopped   atomic.Bool
+	dispatchC atomic.Int64 // dispatcher goroutine count; mirrors len(p.jobs)
+	once      sync.Once
+	started   atomic.Bool
+
+	// mu guards cancel. Start publishes the dispatcher's CancelFunc while
+	// Shutdown reads it, and neither is atomic. Without the lock a Shutdown
+	// that wins the race against Start leaves the dispatcher parked on an
+	// idle Dequeue forever; the same critical section also closes the
+	// stopped-check/started-CAS window.
+	mu     sync.Mutex
+	cancel context.CancelFunc
 
 	// Stats
 	processed atomic.Uint64
@@ -184,10 +192,23 @@ func New(sink Sink, opts ...Option) *Pool {
 //   - The handler context is ctx itself. A graceful Shutdown deliberately does
 //     NOT cancel it, so jobs already running get to finish; only cancelling ctx
 //     itself (the caller's own shutdown) aborts them.
+//
+// The second point is a contract on the caller: passing a context that is
+// cancelled when the caller starts shutting down defeats the drain, because
+// Shutdown would then cancel the very handlers it waits for. Derive the handler
+// context with context.WithoutCancel if the signal and the drain must share
+// values; cmd/dispatchd does exactly that.
 func (p *Pool) Start(ctx context.Context) error {
 	if ctx == nil {
 		return ErrNilContext
 	}
+
+	// The whole start-up decision runs under mu, so a concurrent Shutdown
+	// either sees started=true and gets to cancel the dispatcher, or blocks
+	// here until the dispatcher exists to be cancelled.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.stopped.Load() {
 		return ErrPoolClosed
 	}
@@ -230,13 +251,27 @@ func (p *Pool) dispatch(ctx context.Context) {
 			switch {
 			case errors.Is(err, queue.ErrClosed):
 				p.log().Info("queue closed, dispatcher stopping")
+				return
 			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 				// Expected during shutdown.
+				return
 			default:
+				// A persistent backend failure must not kill the pool: the
+				// dispatcher keeps polling so it recovers when the queue does.
+				// It must not fall through to the send below either, because a
+				// Dequeue error means no delivery was produced — pushing the
+				// zero-value Delivery would run the handler on a job that does
+				// not exist and count it as a success.
 				p.log().Error("dequeue failed", "err", err)
+				continue
 			}
-			return
 		}
+
+		// The delivery is now off the queue and owned by this pool: it is
+		// either sitting in p.jobs or already in a worker's hands. Counting it
+		// here, and releasing it when the worker returns, is what makes
+		// InFlight() cover both halves of that window.
+		p.dispatchC.Add(1)
 
 		select {
 		case p.jobs <- d:
@@ -255,6 +290,10 @@ func (p *Pool) dispatch(ctx context.Context) {
 func (p *Pool) runWorker(handlerCtx, throttleCtx context.Context) {
 	for d := range p.jobs {
 		p.execute(handlerCtx, throttleCtx, d)
+		// The delivery is finished with, whatever the outcome: the limiter
+		// abort path abandons it to the queue's visibility timeout and never
+		// touches Ack/Nack, so this must not live inside execute's branches.
+		p.dispatchC.Add(-1)
 	}
 }
 
@@ -363,6 +402,15 @@ func (p *Pool) safeHandle(ctx context.Context, d queue.Delivery) (err error) {
 	return p.cfg.Handler(ctx, d)
 }
 
+// dispatchCancel returns the CancelFunc for the dispatch context, or nil if
+// Start has not run yet. It takes mu because Start publishes the func and
+// Shutdown reads it; the two can overlap when a caller races them.
+func (p *Pool) dispatchCancel() context.CancelFunc {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cancel
+}
+
 // Shutdown stops accepting new work and waits for in-flight jobs to finish.
 // The in-flight jobs get to complete because the workers keep draining p.jobs
 // while the dispatcher has already stopped feeding it.
@@ -376,8 +424,8 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		// Cancel the dispatch context so a dispatcher blocked inside Dequeue (or
 		// a worker parked in Limiter.Wait) unwinds promptly. Without this,
 		// Shutdown would wait on an idle queue until its own context expired.
-		if p.cancel != nil {
-			p.cancel()
+		if cancel := p.dispatchCancel(); cancel != nil {
+			cancel()
 		}
 	})
 
@@ -426,9 +474,13 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	}
 }
 
-// InFlight reports how many jobs are currently queued for workers but not yet
-// finished. It is an approximation, useful for shutdown diagnostics.
-func (p *Pool) InFlight() int { return len(p.jobs) }
+// InFlight reports how many jobs the dispatcher has taken off the queue but no
+// worker has finished yet. It counts work sitting in the jobs channel plus work
+// already picked up, so it stays non-zero for the whole drain and reaches zero
+// exactly when the last worker returns (the dispatcher closes jobs before the
+// workers drain it). It is approximate — one atomic snapshot of two counters —
+// and exists for shutdown diagnostics, which is why the drain timeout reports it.
+func (p *Pool) InFlight() int { return len(p.jobs) + int(p.dispatchC.Load()) }
 
 // PoolStats is a snapshot of pool counters.
 type PoolStats struct {

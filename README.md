@@ -217,6 +217,11 @@ dan sekali lagi setelah memberikan token.
 handler. `Shutdown` yang graceful hanya membatalkan context dispatch, sehingga job
 yang sedang berjalan selesai sampai tuntas alih-alih dibatalkan di tengah handler.
 
+Karena context handler adalah `ctx` itu sendiri, pemanggil tidak boleh menyerahkan
+context yang mati saat `Shutdown` berjalan. `cmd/dispatchd` menurunkan context
+handler dari context `SIGTERM` lewat `context.WithoutCancel`: nilainya tetap
+terbawa, tetapi pembatalan sinyal tidak merambat ke job yang sedang melayang.
+
 `Shutdown(ctx)` lalu melakukan drain: ia berhenti melakukan dequeue, menunggu job
 yang masih melayang sampai `DrainTimeout`, dan saat kedaluwarsa mengembalikan error
 yang membungkus `context.DeadlineExceeded` beserta jumlah job yang masih melayang.
@@ -391,6 +396,13 @@ Beberapa perilaku spesifik yang dikunci oleh test:
 
 - `TestWaitWithAlreadyCancelledContextDoesNotConsume` — regresi fail-open tadi.
 - `TestKeyedIsNotALimiter` — pilihan type-system di atas.
+- `TestServeDrainsInFlightHandlersOnSignal` — `serve` menyerahkan context ke
+  `Start`, bukan ke `Shutdown`. Selama wiring-nya salah, `SIGTERM` membatalkan
+  handler yang justru sedang ditunggu drain, dan job yang melayang kembali
+  sebagai "handler interrupted by shutdown".
+- `TestDequeueErrorDoesNotRunTheHandlerOnAPhantomJob` — `Dequeue` yang gagal
+  tidak pernah menghasilkan delivery, jadi handler tidak boleh dipanggil dengan
+  `Delivery` bernilai nol.
 - Urutan prioritas versus FIFO untuk prioritas yang sama, termasuk job tertunda.
 - Reservation yang kedaluwarsa tidak memakan satu attempt.
 - `Nack` mengembalikan `ErrRetryScheduled` saat akan retry, `ErrJobFailed` saat
