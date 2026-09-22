@@ -516,3 +516,254 @@ func TestStatsTracksDelayedAndReadySeparately(t *testing.T) {
 		return q.Stats().Ready == 2
 	})
 }
+
+// TestExtendAddsToTheCurrentDeadline pins the documented meaning of Extend:
+// "pushes a reservation's deadline back by ext". A handler that extends twice
+// for the same amount of work must end up with twice the room, so the second
+// call has to build on the deadline the first one produced. Overwriting it
+// instead silently discards every extension but the last, which is worse than
+// not extending at all: the caller believes the reservation is safe.
+func TestExtendAddsToTheCurrentDeadline(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond), WithVisibility(10*time.Second))
+	defer q.Close()
+
+	if err := q.Enqueue(Entry{ID: "long"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	d, err := q.Dequeue(ctx)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	// Each Extend asks for 5s more, at 4s and then 8s. Adding gives a deadline
+	// of 20s; overwriting gives 8s + 5s = 13s, discarding the first extension.
+	clk.Advance(4 * time.Second)
+	if err := q.Extend(d, 5*time.Second); err != nil {
+		t.Fatalf("Extend #1: %v", err)
+	}
+	clk.Advance(4 * time.Second)
+	if err := q.Extend(d, 5*time.Second); err != nil {
+		t.Fatalf("Extend #2: %v", err)
+	}
+
+	// 14s in: past the overwritten deadline of 13s, inside the accumulated one
+	// of 20s. The margins on both sides are seconds wide, so only the semantics
+	// under test decide the outcome.
+	clk.Advance(6 * time.Second)
+
+	// Let the scheduler notice. In the buggy build it requeues the job within a
+	// millisecond or two; in the fixed one there is nothing to notice, so this
+	// only costs a moment. Waiting for the requeue rather than sleeping a fixed
+	// amount keeps the failure deterministic instead of load-dependent.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && q.Stats().Requeued == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := q.Ack(d); err != nil {
+		t.Fatalf("Ack after two Extends = %v, want nil: an extension was discarded", err)
+	}
+}
+
+// TestSubscribeFiltersByTopic covers the subscription's topic set. Subscribe
+// accepts topics and is documented as "delivering events for the given
+// topics", so a subscriber that asked for one topic must not receive the
+// others. Filtering has to happen while the subscription is still reachable
+// under q.mu, because a subscriber that never reads its channel would
+// otherwise fill its buffer with events it did not ask for and drop the ones
+// it did.
+func TestSubscribeFiltersByTopic(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond))
+	defer q.Close()
+
+	doneOnly := q.Subscribe(TopicDone)
+	all := q.Subscribe() // no topics means everything
+
+	if err := q.Enqueue(Entry{ID: "j", MaxAttempts: 1}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	d, err := q.Dequeue(ctx)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := q.Ack(d); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	// Draining deterministically: the events for a completed job were emitted
+	// before Ack returned, so they are already buffered.
+	wantAll := []Topic{TopicEnqueued, TopicDequeued, TopicDone}
+	for i, want := range wantAll {
+		select {
+		case ev, ok := <-all.C():
+			if !ok {
+				t.Fatalf("all-topics subscription closed early")
+			}
+			if ev.Topic != want {
+				t.Fatalf("all event %d = %v, want %v", i, ev.Topic, want)
+			}
+		default:
+			t.Fatalf("all-topics subscription missed event %d (%v)", i, want)
+		}
+	}
+
+	select {
+	case ev := <-doneOnly.C():
+		if ev.Topic != TopicDone {
+			t.Fatalf("done-only subscription received %v, want %v", ev.Topic, TopicDone)
+		}
+	default:
+		t.Fatalf("done-only subscription received nothing")
+	}
+	// Nothing else may be waiting for it.
+	select {
+	case ev := <-doneOnly.C():
+		t.Fatalf("done-only subscription also received %v, but it subscribed to %v only",
+			ev.Topic, TopicDone)
+	default:
+	}
+}
+
+// TestDequeueEmitsTopicDequeued covers the one advertised topic the queue never
+// produced. TopicDequeued is documented as firing "when a job is reserved for a
+// consumer" and appears in the README's event diagram, but nothing emitted it,
+// so a subscriber waiting on it waited forever. The reserved transition is the
+// one an operator needs in order to see which job is in flight right now —
+// StateReserved exists for the same reason and was equally unreachable.
+func TestDequeueEmitsTopicDequeued(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond), WithVisibility(50*time.Millisecond))
+	defer q.Close()
+
+	sub := q.Subscribe(TopicDequeued)
+
+	if err := q.Enqueue(Entry{ID: "j", MaxAttempts: 1}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	d, err := q.Dequeue(ctx)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	assertReservedEvent(t, sub, 1)
+
+	// The reservation lapses without an Ack, so the scheduler requeues the job
+	// and a second Dequeue reserves it again. That is a fresh reservation and
+	// has to fire again, with the attempt count restored to 1: a lapsed
+	// reservation does not consume an attempt.
+	clk.Advance(time.Minute)
+	waitFor(t, "the lapsed job to be requeued", func() bool { return q.Stats().Requeued == 1 })
+
+	d2, err := q.Dequeue(ctx)
+	if err != nil {
+		t.Fatalf("second Dequeue: %v", err)
+	}
+	assertReservedEvent(t, sub, 1)
+
+	// The first delivery's reservation lapsed, so it is no longer ackable; the
+	// second one is. Asserting both keeps the requeue honest: the job must have
+	// actually changed hands rather than being handed out twice under one token.
+	if err := q.Ack(d); !errors.Is(err, ErrUnknownJob) {
+		t.Fatalf("Ack of the lapsed delivery = %v, want ErrUnknownJob", err)
+	}
+	if err := q.Ack(d2); err != nil {
+		t.Fatalf("Ack of the live delivery = %v, want nil", err)
+	}
+}
+
+// assertReservedEvent consumes one event and checks it describes a reservation
+// of job "j" at the given attempt.
+func assertReservedEvent(t *testing.T, sub *Subscription, attempt int) {
+	t.Helper()
+	select {
+	case ev, ok := <-sub.C():
+		if !ok {
+			t.Fatalf("subscription closed before delivering %v", TopicDequeued)
+		}
+		if ev.Topic != TopicDequeued {
+			t.Fatalf("topic = %v, want %v", ev.Topic, TopicDequeued)
+		}
+		if ev.JobID != "j" {
+			t.Fatalf("JobID = %q, want %q", ev.JobID, "j")
+		}
+		if ev.State != StateReserved {
+			t.Fatalf("State = %v, want %v", ev.State, StateReserved)
+		}
+		if ev.Attempt != attempt {
+			t.Fatalf("Attempt = %d, want %d", ev.Attempt, attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("no %v event: Dequeue did not announce the reservation", TopicDequeued)
+	}
+}
+
+// TestCloseRacingSubscribeNeverSendsOnAClosedChannel covers a send on a closed
+// channel between a producer and Subscription.Close. emit snapshots the
+// subscriber set under q.mu, releases the lock, and only then sends; Close
+// deletes itself and closes its channel with nothing coordinating the two. A
+// send that lands in that window panics, and no recover can save it.
+//
+// The real wiring makes this reachable: cmd/dispatchd closes its subscription
+// while producers are still enqueuing. Many subscribers and a busy producer
+// widen the window enough to hit it in a short test.
+func TestCloseRacingSubscribeNeverSendsOnAClosedChannel(t *testing.T) {
+	if raceEnabled {
+		// Substantially slower under -race, and the window is the same width.
+		t.Skip("timing-sensitive; exercised without -race")
+	}
+	const (
+		subscribers = 200
+		rounds      = 200
+	)
+
+	for round := range rounds {
+		q := New(WithPollInterval(time.Millisecond))
+		subs := make([]*Subscription, 0, subscribers)
+		for range subscribers {
+			subs = append(subs, q.Subscribe(TopicEnqueued))
+		}
+
+		stop := make(chan struct{})
+		var producer sync.WaitGroup
+		producer.Add(1)
+		go func() {
+			defer producer.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// Distinct IDs: duplicates are rejected, and a rejected
+				// Enqueue never reaches emit.
+				_ = q.Enqueue(Entry{ID: fmt.Sprintf("j-%d", i), MaxAttempts: 1})
+			}
+		}()
+
+		// Vary where the close lands relative to the producer's first emits.
+		time.Sleep(time.Duration(round%5) * 100 * time.Microsecond)
+
+		var closers sync.WaitGroup
+		for _, s := range subs {
+			closers.Add(1)
+			go func(s *Subscription) {
+				defer closers.Done()
+				_ = s.Close()
+			}(s)
+		}
+		closers.Wait()
+
+		close(stop)
+		producer.Wait()
+		if err := q.Close(); err != nil {
+			t.Fatalf("round %d: Close: %v", round, err)
+		}
+	}
+}

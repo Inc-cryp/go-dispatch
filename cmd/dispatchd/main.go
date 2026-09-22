@@ -316,6 +316,7 @@ func probeHealth(url string, logger *slog.Logger) error {
 func registerObservers(ctx context.Context, bus *eventbus.Bus, q *queue.Queue, logger *slog.Logger) {
 	sub := q.Subscribe(
 		queue.TopicEnqueued,
+		queue.TopicDequeued,
 		queue.TopicDone,
 		queue.TopicFailed,
 		queue.TopicRetried,
