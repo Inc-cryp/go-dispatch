@@ -11,9 +11,12 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # Pin the toolchain used for the builder stage. Override with
-        # `GO_VERSION=1.24 docker compose build` to reproduce an older build.
-        GO_VERSION: ${GO_VERSION:-1.26}
+        # Pin the toolchain used for the builder stage, matching the Dockerfile
+        # default, the Makefile, CI, and the `go` directive in go.mod. The
+        # official golang images set GOTOOLCHAIN=local, so the image's Go is
+        # final: overriding this with a release older than go.mod's minimum
+        # fails the build rather than downloading a newer toolchain.
+        GO_VERSION: ${GO_VERSION:-1.25}
     image: dispatch:local
     container_name: dispatchd
     # The image runs as uid 65534 (nobody) with no shell and no writable
