@@ -69,6 +69,9 @@ type config struct {
 	// image is FROM scratch: there is no wget or curl inside it, so the binary
 	// has to be its own health probe.
 	healthcheck string
+	// maxLapses bounds how many times one job may lose its reservation before
+	// it is dead-lettered. Zero means unbounded, which is the queue default.
+	maxLapses int
 }
 
 func parseFlags(args []string) config {
@@ -82,6 +85,7 @@ func parseFlags(args []string) config {
 	fs.DurationVar(&cfg.shutdownFor, "shutdown-timeout", 10*time.Second, "graceful shutdown deadline")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	fs.StringVar(&cfg.healthcheck, "healthcheck", "", "probe this URL and exit 0/1 instead of serving (for container health checks)")
+	fs.IntVar(&cfg.maxLapses, "max-lapses", 0, "dead-letter a job after this many lapsed reservations (0 disables the bound)")
 	if err := fs.Parse(args); err != nil {
 		// flag already printed the error and usage.
 		os.Exit(2)
@@ -91,6 +95,11 @@ func parseFlags(args []string) config {
 	}
 	if cfg.subjects < 0 {
 		cfg.subjects = 0
+	}
+	if cfg.maxLapses < 0 {
+		// A negative bound is meaningless, and MaxLapses only treats 0 as
+		// "unbounded", so passing it through would dead-letter every job.
+		cfg.maxLapses = 0
 	}
 	return cfg
 }
@@ -239,7 +248,7 @@ func serve(
 		return fmt.Errorf("starting worker pool: %w", err)
 	}
 
-	produced := produce(ctx, q, cfg.subjects, logger)
+	produced := produce(ctx, q, cfg.subjects, cfg.maxLapses, logger)
 	logger.Info("workload submitted", "jobs", produced)
 
 	// Wait for operator signal, a listener failure, or natural completion.
@@ -426,7 +435,7 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 // produce generates a mixed workload. It returns how many jobs were accepted.
-func produce(ctx context.Context, q *queue.Queue, n int, logger *slog.Logger) int {
+func produce(ctx context.Context, q *queue.Queue, n, maxLapses int, logger *slog.Logger) int {
 	kinds := []struct {
 		kind     string
 		priority int
@@ -466,6 +475,7 @@ func produce(ctx context.Context, q *queue.Queue, n int, logger *slog.Logger) in
 			Payload:     k.kind,
 			Priority:    k.priority,
 			MaxAttempts: k.attempts,
+			MaxLapses:   maxLapses,
 			Backoff: func(int) time.Duration {
 				return k.backoff
 			},
@@ -513,6 +523,7 @@ func newServer(addr string, q *queue.Queue, pool *worker.Pool, logger *slog.Logg
 				"failed":      qs.Failed,
 				"retried":     qs.Retried,
 				"requeued":    qs.Requeued,
+				"lapsed":      qs.Lapsed,
 				"dead_letter": qs.DeadLetter,
 				"closed":      qs.Closed,
 			},
@@ -527,7 +538,11 @@ func newServer(addr string, q *queue.Queue, pool *worker.Pool, logger *slog.Logg
 				"stopped":   ps.Stopped,
 			},
 			"dead_letters": q.DeadLetters(),
-			"uptime_s":     time.Since(startTime).Seconds(),
+			// Only the jobs that hit a MaxLapses bound, so the demo's
+			// workload shows the difference between the two ways a job
+			// can be given up on.
+			"lapsed":   q.LapseInfos(),
+			"uptime_s": time.Since(startTime).Seconds(),
 		}
 		writeJSON(w, http.StatusOK, body, logger)
 	})

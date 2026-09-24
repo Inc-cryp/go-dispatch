@@ -59,6 +59,9 @@ var (
 	// ErrJobFailed is returned by Nack when the job exhausted its attempts. The
 	// original cause is wrapped and available through errors.Is/errors.As.
 	ErrJobFailed = errors.New("queue: job failed after max attempts")
+	// ErrMaxLapses is reported on the TopicFailed event when a job is
+	// dead-lettered because its reservation lapsed MaxLapses times.
+	ErrMaxLapses = errors.New("queue: job failed after max lapses")
 )
 
 // JobState is the lifecycle state of a job.
@@ -98,6 +101,14 @@ func (s JobState) String() string {
 // rejects a duplicate live ID with ErrInvalidEntry; deduplication covers queued
 // and reserved jobs alike, so a consumer holding a reservation also blocks a
 // second submission of the same ID.
+//
+// MaxAttempts and MaxLapses bound two different failure modes, and neither
+// substitutes for the other. A handler that *reports* failure consumes an
+// attempt and is bounded by MaxAttempts; a handler that never reports back at
+// all — because it hangs, crashes, or the machine is suspended — leaves a
+// lapsed reservation, and by design that costs no attempt (see the package
+// documentation). Without MaxLapses such a job is requeued forever and can
+// never reach the dead-letter list.
 type Entry struct {
 	// ID uniquely identifies the job. Required.
 	ID string
@@ -110,6 +121,12 @@ type Entry struct {
 	// MaxAttempts is the total number of delivery attempts allowed, including
 	// the first. Values below 1 are treated as 1.
 	MaxAttempts int
+	// MaxLapses bounds how many times a reservation may lapse before the job
+	// is dead-lettered instead of requeued once more. The job is
+	// dead-lettered on the lapse that reaches this count, so MaxLapses = 1
+	// gives up after the first lapsed reservation. Zero or below means
+	// unbounded, which is the historical behaviour.
+	MaxLapses int
 	// Visibility is how long a reservation is held before the job is assumed
 	// lost and requeued. Zero uses the queue default.
 	Visibility time.Duration
@@ -146,8 +163,17 @@ type Stats struct {
 	Failed     uint64 `json:"failed"`
 	Retried    uint64 `json:"retried"`
 	Requeued   uint64 `json:"requeued"` // requeued because a reservation lapsed
+	Lapsed     uint64 `json:"lapsed"`   // dead-lettered because MaxLapses was reached
 	DeadLetter uint64 `json:"dead_letter"`
 	Closed     bool   `json:"closed"`
+}
+
+// LapseInfo describes a job that was dead-lettered by its MaxLapses bound.
+// Attempts is deliberately small next to Reservations: that gap is the point of
+// the bound, since a lapsed reservation is not charged as an attempt.
+type LapseInfo struct {
+	Reservations int `json:"reservations"`
+	Attempts     int `json:"attempts"`
 }
 
 // Topic is a fan-out notification channel for queue activity.
@@ -299,10 +325,16 @@ type Queue struct {
 	seq      uint64 // FIFO tiebreaker, monotonic
 	closed   bool
 
+	// lapseInfos describes the jobs dead-lettered by MaxLapses, keyed by ID.
+	// It stays nil until the first such job arrives: most queues never
+	// configure a bound and should not pay for the map.
+	lapseInfos map[string]LapseInfo
+
 	doneCount    uint64
 	failedCount  uint64
 	retriedCount uint64
 	requeueCount uint64
+	lapsedCount  uint64 // dead-lettered by MaxLapses rather than by attempts
 
 	subs   map[*Subscription]struct{}
 	notify chan struct{} // edge trigger: wakes Dequeue waiters
@@ -346,9 +378,10 @@ func New(opts ...Option) *Queue {
 // so readiness is derived from RunAt alone and never duplicated in a flag.
 type item struct {
 	entry   Entry
-	attempt int
 	seq     uint64
-	token   uint64    // 0 while not reserved
+	attempt int       // delivery attempts so far, 1-based while reserved
+	lapses  int       // reservations that lapsed without an Ack or Nack
+	token   uint64    // reservation token, 0 while not reserved
 	deadl   time.Time // reservation deadline while reserved
 }
 
@@ -421,6 +454,9 @@ func (q *Queue) Enqueue(e Entry) error {
 	it := &item{entry: e, seq: q.seq}
 	q.seq++
 	q.byID[e.ID] = it
+	// A dead-lettered ID may be submitted again, and the record of why it was
+	// given up on belongs to the previous life, not this one.
+	delete(q.lapseInfos, e.ID)
 	heap.Push(&q.heap, it)
 	q.mu.Unlock()
 
@@ -624,6 +660,7 @@ func (q *Queue) Stats() Stats {
 		Failed:     q.failedCount,
 		Retried:    q.retriedCount,
 		Requeued:   q.requeueCount,
+		Lapsed:     q.lapsedCount,
 		DeadLetter: uint64(len(q.dead)),
 		Closed:     q.closed,
 	}
@@ -635,6 +672,20 @@ func (q *Queue) DeadLetters() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return append([]string(nil), q.dead...)
+}
+
+// LapseInfos returns the jobs dead-lettered by their MaxLapses bound, keyed by
+// job ID. The map is empty for a queue that never set MaxLapses, which is the
+// same shape as DeadLetters: enough for a human to see what was given up on, and
+// deliberately not for machine consumption.
+func (q *Queue) LapseInfos() map[string]LapseInfo {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make(map[string]LapseInfo, len(q.lapseInfos))
+	for id, info := range q.lapseInfos {
+		out[id] = info
+	}
+	return out
 }
 
 // Close stops the scheduler and releases every waiter. In-flight reservations
@@ -682,9 +733,17 @@ func (q *Queue) scheduler() {
 }
 
 // reap requeues lapsed reservations and wakes waiters when work is deliverable.
+//
+// A lapsed reservation still does not consume an attempt: the worker never
+// reported a verdict, so the job must not be punished for it. But an entry with
+// MaxLapses set also counts the lapse itself, and once that count is reached the
+// job is dead-lettered rather than requeued a further time. Without the bound a
+// handler that hangs on every delivery keeps the job alive forever, cycling
+// between ready and reserved and never reaching the dead-letter list.
 func (q *Queue) reap() {
 	now := q.cfg.now()
 	var lapsed []Event
+	var deadEvents []Event
 
 	q.mu.Lock()
 	for token, it := range q.reserved {
@@ -697,6 +756,24 @@ func (q *Queue) reap() {
 		if it.attempt < 0 {
 			it.attempt = 0
 		}
+		it.lapses++
+
+		if limit := it.entry.MaxLapses; limit > 0 && it.lapses >= limit {
+			delete(q.byID, it.entry.ID)
+			q.failedCount++
+			q.lapsedCount++
+			q.rememberDead(it.entry.ID)
+			if q.lapseInfos == nil {
+				q.lapseInfos = make(map[string]LapseInfo)
+			}
+			q.lapseInfos[it.entry.ID] = LapseInfo{Reservations: it.lapses, Attempts: it.attempt}
+			deadEvents = append(deadEvents, Event{
+				Topic: TopicFailed, JobID: it.entry.ID, State: StateFailed,
+				Attempt: it.attempt, Err: ErrMaxLapses, At: now,
+			})
+			continue
+		}
+
 		it.entry.RunAt = now
 		q.requeueCount++
 		heap.Push(&q.heap, it)
@@ -711,7 +788,10 @@ func (q *Queue) reap() {
 	for _, e := range lapsed {
 		q.emit(e)
 	}
-	if due || len(lapsed) > 0 {
+	for _, e := range deadEvents {
+		q.emit(e)
+	}
+	if due || len(lapsed) > 0 || len(deadEvents) > 0 {
 		q.signal(q.notify)
 	}
 }

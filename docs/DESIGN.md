@@ -97,11 +97,23 @@ reservation yang kedaluwarsa itu gratis, dan hanya `Nack` eksplisit yang
 menghabiskan satu attempt.
 
 Biayanya: job yang handler-nya secara konsisten hidup lebih lama dari visibility
-timeout-nya akan dikirim ulang selamanya. Itu patologi nyata, dan perbaikan yang
-jujur adalah attempt counter berbatas yang menghitung *delivery* sekaligus vonis.
-Ia tidak diimplementasikan, karena semantiknya cepat membingungkan (apa arti
-pengiriman ulang job dengan `MaxAttempts: 1`?) dan perilaku saat ini setidaknya
-bisa dipertahankan: **sebuah job hanya dihukum karena vonis yang ia hasilkan.**
+timeout-nya akan dikirim ulang selamanya. Itu patologi nyata. Perbaikan yang jujur
+harus membiarkan lapse tetap gratis — itulah alasan aturan ini ada — tetapi
+membatasi berapa kali sebuah lapse boleh terjadi, dan itulah `MaxLapses`:
+
+```go
+q.Enqueue(queue.Entry{ID: "report", MaxAttempts: 3, MaxLapses: 5})
+```
+
+Setiap lapse menaikkan counter lapse job itu, dan begitu counter mencapai
+`MaxLapses` job di-dead-letter dengan `ErrMaxLapses` alih-alih di-requeue sekali
+lagi. Counter-nya terpisah dari attempt, jadi semantiknya tidak membingungkan:
+`MaxAttempts` membatasi vonis yang dilaporkan handler, `MaxLapses` membatasi
+ketiadaan vonis. Sebuah job bisa punya `MaxAttempts: 1` dan `MaxLapses: 5` tanpa
+kontradiksi — satu attempt yang tidak pernah dilaporkan hasilnya boleh hilang
+lima kali sebelum queue menyerah. `MaxLapses = 0` berarti tak terbatas dan
+mempertahankan perilaku lama; **sebuah job tetap hanya dihukum karena vonis yang
+ia hasilkan**, kecuali anggaran lapse yang eksplisit habis.
 
 ### 2.3 Sentinel zero-time
 
@@ -464,9 +476,15 @@ SQS/Redis/Postgres. Secara konkret:
 - **Idempotency key.** Pengiriman at-least-once adalah kontrak yang harus
   dihormati oleh *consumer*-nya. Queue bisa membantu dengan memunculkan dedup key,
   tetapi ia tidak bisa menyediakan exactly-once sendirian.
-- **Attempt berbatas untuk reservation yang kedaluwarsa.** Aturan "reservation
-  kedaluwarsa itu gratis" di §2.2 memerlukan counter pendamping, atau job yang
-  patologis menjadi abadi.
+- **Attempt berbatas untuk reservation yang kedaluwarsa — sudah dikerjakan.**
+  `Entry.MaxLapses` membatasi berapa kali satu reservation boleh kedaluwarsa
+  sebelum job di-dead-letter, tanpa mengubah aturan "reservation kedaluwarsa itu
+  gratis" di §2.2: lapse tetap tidak memakan attempt, ia hanya punya anggarannya
+  sendiri. `MaxLapses = 0` mempertahankan perilaku lama (tak terbatas), sehingga
+  job patologis yang selalu melewati visibility timeout tidak lagi menjadi abadi
+  begitu bound diaktifkan. Yang masih tersisa untuk backend terdistribusi
+  sungguhan adalah menyimpan counter lapse ini di store bersama, karena scheduler
+  antar proses tidak lagi berbagi memori.
 - **Fair scheduling.** Satu priority heap global membuat pekerjaan berprioritas
   rendah kelaparan di bawah beban yang terus-menerus. Queue per-tenant dengan
   weighted round-robin adalah perbaikan standarnya.

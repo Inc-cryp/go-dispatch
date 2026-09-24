@@ -767,3 +767,204 @@ func TestCloseRacingSubscribeNeverSendsOnAClosedChannel(t *testing.T) {
 		}
 	}
 }
+
+// TestReapDoesNotChargeAnAttemptForALapse pins the documented rule that a lapsed
+// reservation is free: the job must come back at attempt 1, not attempt 2. The
+// MaxLapses work below sits directly on top of this rule, so it gets its own
+// test rather than only being implied by the unbounded case.
+func TestReapDoesNotChargeAnAttemptForALapse(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond), WithVisibility(50*time.Millisecond))
+	defer q.Close()
+
+	if err := q.Enqueue(Entry{ID: "free", MaxAttempts: 1, MaxLapses: 3}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Lapse the reservation twice. Both laps sit under MaxLapses, so the job
+	// must come back each time with its attempt count restored.
+	for i := 1; i <= 2; i++ {
+		d, err := q.Dequeue(ctx)
+		if err != nil {
+			t.Fatalf("Dequeue %d: %v", i, err)
+		}
+		if d.Attempt != 1 {
+			t.Fatalf("attempt on reservation %d = %d, want 1", i, d.Attempt)
+		}
+		clk.Advance(time.Minute)
+		waitFor(t, fmt.Sprintf("requeue %d", i), func() bool { return q.Stats().Requeued == uint64(i) })
+	}
+
+	// MaxAttempts is 1 and no attempt was ever charged, so the job is still
+	// alive after three reservations and zero attempts.
+	st := q.Stats()
+	if st.DeadLetter != 0 || st.Failed != 0 {
+		t.Fatalf("free lapses exhausted the job: %+v", st)
+	}
+}
+
+// TestMaxLapsesDeadLettersTheJob covers the bound that stops a handler which
+// never reports back from keeping its job alive forever. Every reservation is
+// allowed to lapse, exactly as it would for a handler that hangs on each
+// delivery; the job has to reach the dead-letter list rather than cycle.
+func TestMaxLapsesDeadLettersTheJob(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond), WithVisibility(50*time.Millisecond))
+	defer q.Close()
+
+	sub := q.Subscribe(TopicRequeued, TopicFailed)
+	defer func() { _ = sub.Close() }()
+
+	if err := q.Enqueue(Entry{ID: "stuck", MaxAttempts: 5, MaxLapses: 2}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// First lapse: still under the bound, so the job is requeued.
+	if _, err := q.Dequeue(ctx); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	clk.Advance(time.Minute)
+	waitFor(t, "the first lapse to requeue", func() bool { return q.Stats().Requeued == 1 })
+
+	if got := q.Stats().DeadLetter; got != 0 {
+		t.Fatalf("dead-lettered after one lapse of two: %d", got)
+	}
+
+	// Second lapse reaches the bound: this attempt must dead-letter instead.
+	if _, err := q.Dequeue(ctx); err != nil {
+		t.Fatalf("second Dequeue: %v", err)
+	}
+	clk.Advance(time.Minute)
+	waitFor(t, "the second lapse to dead-letter", func() bool { return q.Stats().DeadLetter == 1 })
+
+	if got := q.Stats().Lapsed; got != 1 {
+		t.Fatalf("Lapsed = %d, want 1", got)
+	}
+	if got := q.Stats().Failed; got != 1 {
+		t.Fatalf("Failed = %d, want 1: the job is terminal", got)
+	}
+	if got := q.Stats().Requeued; got != 1 {
+		t.Fatalf("Requeued = %d, want 1: only the first lapse requeues", got)
+	}
+
+	dead := q.DeadLetters()
+	if len(dead) != 1 || dead[0] != "stuck" {
+		t.Fatalf("DeadLetters = %v, want [stuck]", dead)
+	}
+
+	// The job is terminal, so nothing may hand it out again. A short deadline
+	// keeps this check cheap: Dequeue would otherwise block until ctx expires.
+	term, cancelTerm := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelTerm()
+	if d, err := q.Dequeue(term); err == nil {
+		t.Fatalf("Dequeue after dead-lettering returned %q, want no delivery", d.Job.ID)
+	}
+
+	infos := q.LapseInfos()
+	info, ok := infos["stuck"]
+	if !ok {
+		t.Fatalf("LapseInfos = %v, want an entry for stuck", infos)
+	}
+	if info.Reservations != 2 {
+		t.Fatalf("Reservations = %d, want 2", info.Reservations)
+	}
+	// The whole point of the bound: two reservations, zero attempts charged.
+	if info.Attempts != 0 {
+		t.Fatalf("Attempts = %d, want 0: a lapse is not an attempt", info.Attempts)
+	}
+
+	// The failure is announced, and announced as a lapse rather than as an
+	// exhausted attempt budget.
+	assertTopicErr(t, sub, TopicRequeued, nil)
+	assertTopicErr(t, sub, TopicFailed, ErrMaxLapses)
+}
+
+// TestMaxLapsesUnsetKeepsTheJobAlive is the inverse of the test above: with no
+// bound the historical behaviour has to survive, because it is the documented
+// contract and other code depends on a job outliving a flaky worker.
+func TestMaxLapsesUnsetKeepsTheJobAlive(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond), WithVisibility(50*time.Millisecond))
+	defer q.Close()
+
+	if err := q.Enqueue(Entry{ID: "immortal", MaxAttempts: 1}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	for i := 1; i <= 4; i++ {
+		if _, err := q.Dequeue(ctx); err != nil {
+			t.Fatalf("Dequeue %d: %v", i, err)
+		}
+		clk.Advance(time.Minute)
+		waitFor(t, fmt.Sprintf("requeue %d", i), func() bool { return q.Stats().Requeued == uint64(i) })
+	}
+
+	st := q.Stats()
+	if st.DeadLetter != 0 || st.Lapsed != 0 || st.Failed != 0 {
+		t.Fatalf("unbounded lapse dead-lettered the job: %+v", st)
+	}
+	if len(q.LapseInfos()) != 0 {
+		t.Fatalf("LapseInfos = %v, want empty for an unbounded queue", q.LapseInfos())
+	}
+}
+
+// TestReEnqueueOfALapseDeadLetteredIDForgetsTheOldRecord guards the bookkeeping:
+// an ID that was given up on may be submitted again, and the new job must not
+// inherit the previous life's lapse record.
+func TestReEnqueueOfALapseDeadLetteredIDForgetsTheOldRecord(t *testing.T) {
+	clk := newFakeClock()
+	q := New(WithClock(clk.Now), WithPollInterval(time.Millisecond), WithVisibility(50*time.Millisecond))
+	defer q.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := q.Enqueue(Entry{ID: "retry-me", MaxAttempts: 1, MaxLapses: 1}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.Dequeue(ctx); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	clk.Advance(time.Minute)
+	waitFor(t, "the job to be dead-lettered", func() bool { return q.Stats().DeadLetter == 1 })
+
+	if _, ok := q.LapseInfos()["retry-me"]; !ok {
+		t.Fatal("no lapse record after dead-lettering")
+	}
+
+	if err := q.Enqueue(Entry{ID: "retry-me", MaxAttempts: 1, MaxLapses: 1}); err != nil {
+		t.Fatalf("re-Enqueue: %v", err)
+	}
+	if _, ok := q.LapseInfos()["retry-me"]; ok {
+		t.Fatal("re-enqueued ID kept the previous lapse record")
+	}
+	if d, err := q.Dequeue(ctx); err != nil || d.Job.ID != "retry-me" {
+		t.Fatalf("re-enqueued job not deliverable: id=%q err=%v", d.Job.ID, err)
+	}
+}
+
+// assertTopicErr consumes one event and checks its topic, and its error when one
+// is expected. It reuses the "j"-agnostic shape of assertReservedEvent.
+func assertTopicErr(t *testing.T, sub *Subscription, topic Topic, wantErr error) {
+	t.Helper()
+	select {
+	case ev, ok := <-sub.C():
+		if !ok {
+			t.Fatalf("subscription closed before delivering %v", topic)
+		}
+		if ev.Topic != topic {
+			t.Fatalf("topic = %v, want %v", ev.Topic, topic)
+		}
+		if wantErr != nil && !errors.Is(ev.Err, wantErr) {
+			t.Fatalf("event error = %v, want %v", ev.Err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("no %v event", topic)
+	}
+}

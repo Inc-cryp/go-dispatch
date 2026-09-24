@@ -115,6 +115,19 @@ Reservation yang kedaluwarsa sengaja **tidak** memakan satu attempt. Worker yang
 OOM-killed tidak menggagalkan job; menghukum job karena kegagalan infrastruktur
 akan diam-diam menghabiskan `MaxAttempts` selama crash loop.
 
+Konsekuensinya dulu job seperti itu dikirim ulang selamanya, jadi `Entry` punya
+anggaran lapse yang terpisah dari attempt:
+
+```go
+q.Enqueue(queue.Entry{ID: "report", MaxAttempts: 3, MaxLapses: 5})
+```
+
+Setelah reservation kelima kedaluwarsa tanpa `Ack`/`Nack`, job di-dead-letter
+dengan `ErrMaxLapses` dan `Stats().Lapsed` bertambah. Lapse tetap tidak memakan
+attempt, jadi `MaxAttempts: 1` dengan `MaxLapses: 5` bukan kontradiksi: satu
+attempt yang vonisnya tidak pernah dilaporkan boleh hilang lima kali. `MaxLapses`
+bernilai nol (default) berarti tak terbatas dan mempertahankan perilaku lama.
+
 ### Prioritas itu (priority, readyAt, sequence) — dan sentinel-nya penting
 
 Job yang immediate dinormalkan ke `RunAt` bernilai nol, bukan `time.Now()`. Ini
@@ -397,6 +410,11 @@ Beberapa perilaku yang dikunci test:
   `Delivery` bernilai nol.
 - Urutan prioritas versus FIFO untuk prioritas yang sama, termasuk job tertunda.
 - Reservation yang kedaluwarsa tidak memakan satu attempt.
+- `TestMaxLapsesDeadLettersTheJob` — lapse yang mencapai `MaxLapses` menjadi
+  dead-letter dengan `ErrMaxLapses`, sementara `TestMaxLapsesUnsetKeepsTheJobAlive`
+  menegaskan `MaxLapses: 0` tetap membiarkan job itu hidup.
+- `TestReEnqueueOfALapseDeadLetteredIDForgetsTheOldRecord` — ID yang di-`Enqueue`
+  ulang tidak mewarisi catatan lapse dari kehidupannya yang sebelumnya.
 - `Nack` mengembalikan `ErrRetryScheduled` saat akan retry, `ErrJobFailed` saat
   dead-letter.
 - `Shutdown` pada pool yang sudah berhenti, dan `Close` yang dipanggil dua kali
@@ -431,6 +449,7 @@ Totalnya ~7.800 baris Go termasuk test, di 21 file.
 | `-burst` | `50` | Kapasitas burst limiter |
 | `-addr` | `:8080` | Alamat HTTP untuk listen |
 | `-subjects` | `2000` | Jumlah job yang digenerate saat start |
+| `-max-lapses` | `0` | Dead-letter job setelah sekian reservation kedaluwarsa (`0` menonaktifkan bound) |
 | `-shutdown-timeout` | `10s` | Batas waktu graceful drain |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-healthcheck` | _(off)_ | Probe URL ini lalu keluar 0/1 alih-alih melayani |
