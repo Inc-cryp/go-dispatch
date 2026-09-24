@@ -82,8 +82,11 @@ func TestProduceGeneratesTheRequestedWorkload(t *testing.T) {
 	q := queue.New()
 	defer q.Close()
 
-	const n = 500
-	if got := produce(ctx, q, n, discardLogger()); got != n {
+	const (
+		n         = 500
+		maxLapses = 3
+	)
+	if got := produce(ctx, q, n, maxLapses, discardLogger()); got != n {
 		t.Fatalf("produce returned %d, want %d", got, n)
 	}
 	if got := q.Len(); got != n {
@@ -110,6 +113,11 @@ func TestProduceGeneratesTheRequestedWorkload(t *testing.T) {
 	if p.Job.MaxAttempts < 1 {
 		t.Fatalf("MaxAttempts = %d, want at least 1", p.Job.MaxAttempts)
 	}
+	// The flag has to reach every job, otherwise the bound would only exist
+	// in the queue's API and never in the running daemon.
+	if p.Job.MaxLapses != maxLapses {
+		t.Fatalf("MaxLapses = %d, want %d", p.Job.MaxLapses, maxLapses)
+	}
 	if err := q.Ack(p); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
@@ -127,7 +135,7 @@ func TestProduceStopsOnClosedQueue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if got := produce(ctx, q, 1000, discardLogger()); got != 0 {
+	if got := produce(ctx, q, 1000, 0, discardLogger()); got != 0 {
 		t.Fatalf("produce accepted %d jobs into a closed queue, want 0", got)
 	}
 }
@@ -313,12 +321,17 @@ func TestParseLevel(t *testing.T) {
 }
 
 func TestParseFlagsClampsInvalidValues(t *testing.T) {
-	cfg := parseFlags([]string{"-workers", "0", "-subjects", "-5"})
+	cfg := parseFlags([]string{"-workers", "0", "-subjects", "-5", "-max-lapses", "-3"})
 	if cfg.workers != 1 {
 		t.Errorf("workers = %d, want 1", cfg.workers)
 	}
 	if cfg.subjects != 0 {
 		t.Errorf("subjects = %d, want 0", cfg.subjects)
+	}
+	// Only 0 means "unbounded" to the queue, so a negative flag must not reach
+	// it: every job would be dead-lettered on its first lapse.
+	if cfg.maxLapses != 0 {
+		t.Errorf("maxLapses = %d, want 0", cfg.maxLapses)
 	}
 }
 
@@ -334,7 +347,7 @@ func TestConcurrentProduceAndCloseIsRaceFree(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		produce(ctx, q, 5000, discardLogger())
+		produce(ctx, q, 5000, 0, discardLogger())
 	}()
 
 	time.Sleep(2 * time.Millisecond)
