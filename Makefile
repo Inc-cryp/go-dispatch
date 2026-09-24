@@ -8,6 +8,14 @@ PKGS     ?= ./...
 BENCHTIME ?= 100ms
 RACE      ?= -race
 
+# `staticcheck` and `golangci-lint` are gates, not suggestions: CI installs both
+# and then calls `make lint`, so a missing tool there means a broken install step
+# and the job must go red rather than skip its way to green. The opt-out exists
+# only for a workstation that has neither tool installed yet, and it has to be
+# typed on purpose so nobody gets a green `make check` they did not ask for.
+SKIP_LINTERS ?=
+FATAL_LINTERS := $(if $(SKIP_LINTERS),,exit 1)
+
 # Versions used to build the container. Pinned so `make docker` is reproducible.
 GO_VERSION   ?= 1.25
 IMAGE        ?= dispatch:dev
@@ -74,23 +82,29 @@ fmt-check:
 vet:
 	$(GO) vet $(PKGS)
 
-## staticcheck: run staticcheck if it is installed
+## staticcheck: run staticcheck (set SKIP_LINTERS=1 to skip when it is absent)
 .PHONY: staticcheck
 staticcheck:
-	@command -v staticcheck >/dev/null 2>&1 || { \
+	@if command -v staticcheck >/dev/null 2>&1; then \
+		staticcheck $(PKGS); \
+	elif [ -n "$(FATAL_LINTERS)" ]; then \
 		echo "staticcheck not installed: go install honnef.co/go/tools/cmd/staticcheck@latest"; \
 		exit 1; \
-	}
-	staticcheck $(PKGS)
+	else \
+		echo "staticcheck not installed, skipping because SKIP_LINTERS is set"; \
+	fi
 
-## golangci: run golangci-lint with the config in .golangci.yml
+## golangci: run golangci-lint (set SKIP_LINTERS=1 to skip when it is absent)
 .PHONY: golangci
 golangci:
-	@command -v golangci-lint >/dev/null 2>&1 || { \
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		golangci-lint run $(PKGS); \
+	elif [ -n "$(FATAL_LINTERS)" ]; then \
 		echo "golangci-lint not installed: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; \
 		exit 1; \
-	}
-	golangci-lint run $(PKGS)
+	else \
+		echo "golangci-lint not installed, skipping because SKIP_LINTERS is set"; \
+	fi
 
 ## lint: every static gate, in one command (the CI entrypoint)
 .PHONY: lint
