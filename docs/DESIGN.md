@@ -19,7 +19,7 @@ ini.
 6. [Taksonomi kegagalan](#6-taksonomi-kegagalan)
 7. [Bug yang ditemukan saat proses verifikasi](#7-bug-yang-ditemukan-saat-proses-verifikasi)
 8. [Apa yang akan berubah untuk backend terdistribusi sungguhan](#8-apa-yang-akan-berubah-untuk-backend-terdistribusi-sungguhan)
-9. [Strategi testing](#9-strategi-testing)
+9. [Strategi testing](#9-strategi-testing) — termasuk [checklist saat menambah opsi baru](#91-checklist-saat-menambah-opsi-baru)
 
 ---
 
@@ -526,3 +526,26 @@ Kira-kira setengah repo ini adalah test, dan strateginya disengaja:
 Benchmark diukur, tidak pernah diperkirakan, dan berada di samping kode yang
 diujinya sehingga tidak bisa membusuk secara senyap. Setiap angka di README berasal
 dari run yang tercatat.
+
+### 9.1 Checklist saat menambah opsi baru
+
+Pola kegagalan yang paling sering muncul di repo ini bukan bug aritmatika,
+melainkan opsi yang ditambahkan lalu tidak pernah diuji dalam keadaan
+non-default-nya. Tiga hal ini diminta untuk setiap field baru di `Entry` atau
+setiap `Option` baru:
+
+1. **Nilai nol harus berarti "seperti sebelumnya".** Setiap opsi baru wajib
+   punya perilaku yang mempertahankan kontrak lama saat field-nya tidak diisi,
+   dan perilaku itu harus punya test sendiri. `MaxLapses: 0` = tak terbatas
+   adalah contohnya; tanpa test itu, "backward compatible" cuma klaim.
+2. **Counter baru harus muncul di `Stats`.** Kalau sebuah opsi dapat menyebabkan
+   job berakhir dengan cara baru, jumlahnya harus bisa dibaca tanpa menghitung
+   log. `Stats().Lapsed` ada persis karena `DeadLetter` saja tidak bisa
+   membedakan "habis attempt" dari "habis lapse".
+3. **Jalur terminal baru harus punya sentinel sendiri.** `ErrMaxLapses` berbeda
+   dari `ErrJobFailed` supaya consumer bisa memutuskan retry atau tidak; kalau
+   keduanya memakai error yang sama, perbedaannya hanya kelihatan di dokumentasi.
+
+Yang tidak diminta: opsi yang tidak dipakai siapa pun. Menambah field ke struct
+publik selalu terasa seperti kemajuan, padahal setiap field adalah permukaan yang
+harus dijaga. Tanyakan dulu apakah masalahnya benar-benar ada.
